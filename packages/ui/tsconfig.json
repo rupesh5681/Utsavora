@@ -1,0 +1,1 @@
+{ "extends": "@utsavora/config/tsconfig.next.json", "compilerOptions": { "plugins": [], "incremental": false }, "include": ["src"] }

@@ -1,0 +1,52 @@
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: utsavora, POSTGRES_PASSWORD: utsavora, POSTGRES_DB: utsavora_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U utsavora" --health-interval 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://utsavora:utsavora@localhost:5432/utsavora_test
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Build shared packages
+        run: pnpm --filter "./packages/**" -r build
+      - name: Typecheck
+        run: pnpm -r typecheck
+      - name: Unit tests (pricing, state machines, validation)
+        run: pnpm --filter @utsavora/types --filter @utsavora/validation test
+      - name: API end-to-end tests (real PostgreSQL)
+        run: pnpm --filter @utsavora/api test
+      - name: Migrations are in sync with the schema
+        working-directory: apps/api
+        run: npx drizzle-kit check
+      - name: Build web apps
+        run: pnpm --filter @utsavora/customer-web --filter @utsavora/vendor-portal --filter @utsavora/admin-portal build
+  images:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { name: api, file: infrastructure/docker/api.Dockerfile, app: api }
+          - { name: customer-web, file: infrastructure/docker/web.Dockerfile, app: customer-web }
+          - { name: vendor-portal, file: infrastructure/docker/web.Dockerfile, app: vendor-portal }
+          - { name: admin-portal, file: infrastructure/docker/web.Dockerfile, app: admin-portal }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image ${{ matrix.name }}
+        run: docker build -f ${{ matrix.file }} --build-arg APP=${{ matrix.app }} -t utsavora-${{ matrix.name }}:${{ github.sha }} .
+      # Push to your registry (GHCR/ECR) and deploy from here once hosting is chosen; see docs/deployment.md.

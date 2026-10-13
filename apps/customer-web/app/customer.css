@@ -1,0 +1,216 @@
+/* Customer-site specific layout. Tokens live in @utsavora/ui/styles.css. */
+.hero {
+  background: var(--peacock);
+  color: #fff;
+  padding: 40px 0 48px;
+}
+.hero h1 {
+  color: #fff;
+  max-width: 16ch;
+  font-size: clamp(2.5rem, 6vw, 4.25rem);
+  line-height: 1.02;
+  margin-bottom: 16px;
+}
+.hero .lede {
+  color: rgba(255, 255, 255, 0.86);
+  font-size: var(--t-lg);
+  max-width: 44ch;
+  line-height: 1.45;
+}
+.hero-grid {
+  display: grid;
+  gap: 28px;
+  align-items: center;
+}
+@media (min-width: 960px) {
+  .hero {
+    padding: 64px 0 72px;
+  }
+  .hero-grid {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: 56px;
+  }
+}
+.starter {
+  background: #fff;
+  color: var(--ink);
+  border-radius: var(--r-lg);
+  padding: 22px;
+  box-shadow: 0 30px 60px -30px rgba(0, 0, 0, 0.5);
+  border-top: 6px solid var(--marigold);
+}
+.starter h2 {
+  font-size: var(--t-xl);
+  margin-bottom: 14px;
+}
+.occasion-list {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--line);
+}
+.occasion-list a {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  padding: 18px 4px;
+  border-bottom: 1px solid var(--line);
+  text-decoration: none;
+  color: var(--ink);
+}
+@media (min-width: 720px) {
+  .occasion-list a {
+    grid-template-columns: 320px minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: 24px;
+  }
+}
+.occasion-list a:hover {
+  background: #fffaf0;
+}
+.occasion-list .name {
+  font-family: var(--font-display);
+  font-size: var(--t-xl);
+}
+.occasion-list .go {
+  color: var(--rani);
+  font-weight: 600;
+  font-size: var(--t-sm);
+}
+.steps {
+  display: grid;
+  gap: 20px;
+  counter-reset: step;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+@media (min-width: 720px) {
+  .steps {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+.steps li {
+  counter-increment: step;
+  padding-top: 12px;
+  border-top: 3px solid var(--marigold);
+}
+.steps li::before {
+  content: counter(step);
+  font-family: var(--font-display);
+  font-size: var(--t-2xl);
+  color: var(--marigold-deep);
+  display: block;
+  line-height: 1;
+  margin-bottom: 6px;
+}
+.band {
+  padding: 56px 0;
+}
+.band + .band {
+  border-top: 1px solid var(--line);
+}
+.listing-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.listing-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #fff;
+}
+.listing-card h3 {
+  font-size: var(--t-lg);
+  margin: 0;
+}
+.listing-card h3 a {
+  color: var(--ink);
+  text-decoration: none;
+}
+.listing-card h3 a:hover {
+  color: var(--peacock);
+  text-decoration: underline;
+}
+.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 0;
+}
+.filters {
+  display: grid;
+  gap: 14px;
+}
+.browse {
+  display: grid;
+  gap: 24px;
+}
+@media (min-width: 960px) {
+  .browse {
+    grid-template-columns: 260px minmax(0, 1fr);
+    align-items: start;
+  }
+}
+.compare {
+  display: grid;
+  gap: 16px;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(280px, 1fr);
+  overflow-x: auto;
+  padding-bottom: 8px;
+  scroll-snap-type: x mandatory;
+}
+.compare > * {
+  scroll-snap-align: start;
+}
+.quote-col {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: #fff;
+}
+.quote-col.best {
+  border-color: var(--marigold);
+  box-shadow: inset 0 4px 0 var(--marigold);
+}
+.quote-col .total {
+  font-family: var(--font-display);
+  font-size: var(--t-2xl);
+  line-height: 1;
+}
+.quote-col ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: var(--t-sm);
+}
+.progress {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+}
+.progress li {
+  font-size: var(--t-xs);
+  color: var(--ink-faint);
+  border-top: 4px solid var(--line);
+  padding-top: 6px;
+}
+.progress li.done {
+  border-color: var(--peacock);
+  color: var(--ink-soft);
+}
+.progress li.now {
+  border-color: var(--marigold);
+  color: var(--ink);
+  font-weight: 600;
+}

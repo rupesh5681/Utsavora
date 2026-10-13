@@ -1,0 +1,13 @@
+{
+  "extends": "@utsavora/config/tsconfig.lib.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "declaration": false,
+    "strictPropertyInitialization": false,
+    "types": ["node", "jest"]
+  },
+  "include": ["src", "test", "drizzle.config.ts"]
+}

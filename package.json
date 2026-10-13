@@ -1,0 +1,18 @@
+{
+  "name": "utsavora",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build:packages": "pnpm --filter \"./packages/**\" -r build",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "dev:api": "pnpm --filter @utsavora/api dev",
+    "dev:customer": "pnpm --filter @utsavora/customer-web dev",
+    "dev:vendor": "pnpm --filter @utsavora/vendor-portal dev",
+    "dev:admin": "pnpm --filter @utsavora/admin-portal dev",
+    "db:migrate": "pnpm --filter @utsavora/api prisma:migrate",
+    "db:seed": "pnpm --filter @utsavora/api seed"
+  }
+}

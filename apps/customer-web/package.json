@@ -1,0 +1,28 @@
+{
+  "name": "@utsavora/customer-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "echo 'customer-web: verified by typecheck, build and the API e2e suite'"
+  },
+  "dependencies": {
+    "@utsavora/api-client": "workspace:*",
+    "@utsavora/types": "workspace:*",
+    "@utsavora/ui": "workspace:*",
+    "@utsavora/validation": "workspace:*",
+    "next": "15.5.27",
+    "react": "19.1.9",
+    "react-dom": "19.1.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@utsavora/config": "workspace:*",
+    "typescript": "~5.9.3"
+  }
+}

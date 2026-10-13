@@ -1,0 +1,7 @@
+{
+  "name": "@utsavora/config",
+  "version": "0.1.0",
+  "private": true,
+  "files": ["tsconfig.base.json", "tsconfig.lib.json", "tsconfig.next.json"],
+  "scripts": { "build": "echo config: nothing to build", "typecheck": "echo ok", "test": "echo ok" }
+}
