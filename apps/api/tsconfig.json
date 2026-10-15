@@ -9,5 +9,5 @@
     "strictPropertyInitialization": false,
     "types": ["node", "jest"]
   },
-  "include": ["src", "test", "drizzle.config.ts"]
+  "include": ["src", "test"]
 }

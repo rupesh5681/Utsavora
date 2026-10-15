@@ -1,19 +1,23 @@
 name: CI
 on:
-  push: { branches: [main] }
+  push: { branches: ["**"] }
   pull_request:
 jobs:
   verify:
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16
-        env: { POSTGRES_USER: utsavora, POSTGRES_PASSWORD: utsavora, POSTGRES_DB: utsavora_test }
-        ports: ["5432:5432"]
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: Utsavora-Test-2026!
+        ports: ["1433:1433"]
         options: >-
-          --health-cmd "pg_isready -U utsavora" --health-interval 5s --health-retries 10
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Utsavora-Test-2026!' -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 10s --health-timeout 5s --health-retries 20 --health-start-period 20s
     env:
-      TEST_DATABASE_URL: postgresql://utsavora:utsavora@localhost:5432/utsavora_test
+      TEST_DATABASE_URL: Server=localhost,1433;Database=utsavora_test;User Id=sa;Password=Utsavora-Test-2026!;Encrypt=false;TrustServerCertificate=true
       NEXT_TELEMETRY_DISABLED: 1
     steps:
       - uses: actions/checkout@v4
@@ -25,13 +29,32 @@ jobs:
         run: pnpm --filter "./packages/**" -r build
       - name: Typecheck
         run: pnpm -r typecheck
-      - name: Unit tests (pricing, state machines, validation)
-        run: pnpm --filter @utsavora/types --filter @utsavora/validation test
-      - name: API end-to-end tests (real PostgreSQL)
-        run: pnpm --filter @utsavora/api test
-      - name: Migrations are in sync with the schema
+      - name: Unit tests (pricing, state machines, validation, database helpers)
+        run: |
+          pnpm --filter @utsavora/types --filter @utsavora/validation test
+          pnpm --filter @utsavora/api test:unit
+      - name: API end-to-end tests (real SQL Server 2022)
+        run: .github/scripts/annotate-on-failure.sh pnpm --filter @utsavora/api exec jest --runInBand --selectProjects e2e --ci
+      - name: Production build of the API, migrate twice, seed, and smoke test
         working-directory: apps/api
-        run: npx drizzle-kit check
+        env:
+          DATABASE_URL: Server=localhost,1433;Database=utsavora_ci;User Id=sa;Password=Utsavora-Test-2026!;Encrypt=false;TrustServerCertificate=true
+          SEED_ADMIN_EMAIL: admin@utsavora.local
+          SEED_ADMIN_PASSWORD: ChangeMe-2026
+          SEED_DEMO_DATA: "true"
+          PORT: "4000"
+        run: |
+          docker exec ${{ job.services.mssql.id }} /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Utsavora-Test-2026!' -b -Q "CREATE DATABASE utsavora_ci"
+          pnpm build
+          node dist/db/migrate.js
+          node dist/db/migrate.js | grep "up to date"
+          node dist/db/seed.js
+          node dist/db/seed.js
+          NODE_ENV=production node dist/main.js & API_PID=$!
+          sleep 6
+          curl -fsS localhost:4000/v1/health/ready
+          curl -fsS "localhost:4000/v1/listings?occasion=birthday" | grep -q '"isDemo":true'
+          kill $API_PID
       - name: Build web apps
         run: pnpm --filter @utsavora/customer-web --filter @utsavora/vendor-portal --filter @utsavora/admin-portal build
   images:

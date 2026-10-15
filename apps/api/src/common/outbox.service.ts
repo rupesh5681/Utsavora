@@ -1,9 +1,7 @@
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { and, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
-import { CONFIG, DB, type AppConfig } from '../config';
-import type { Db, DbOrTx, Tx } from '../db/client';
-import { notifications, outboxEvents, userRoles, vendorMembers } from '../db/schema';
 import { label } from '@utsavora/types';
+import { CONFIG, DB, type AppConfig } from '../config';
+import { json, now, sql, type Db, type DbOrTx, type Tx } from '../db/client';
 
 export type OutboxType =
   | 'quote.requested'
@@ -23,6 +21,7 @@ const MAX_ATTEMPTS = 8;
 /**
  * Transactional outbox. Business code calls enqueue() inside its DB transaction; a
  * background loop dispatches events (today: in-app notifications; later: email/SMS/WhatsApp).
+ * Each event is claimed with UPDLOCK + READPAST, so several API instances can dispatch safely.
  */
 @Injectable()
 export class OutboxService implements OnModuleInit, OnModuleDestroy {
@@ -36,7 +35,7 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   async enqueue(tx: DbOrTx, type: OutboxType, payload: Payload) {
-    await tx.insert(outboxEvents).values({ type, payload });
+    await tx.insertInto('outboxEvents').values({ type, payload: json(payload) }).execute();
   }
 
   onModuleInit() {
@@ -50,32 +49,17 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
     if (this.timer) clearInterval(this.timer);
   }
 
-  /** Processes a batch. Safe to run concurrently across instances (SKIP LOCKED). Returns count processed. */
+  /** Processes up to `limit` events, one transaction each. Returns the number processed. */
   async dispatchPending(limit = 50): Promise<number> {
     if (this.running) return 0;
     this.running = true;
     let processed = 0;
     try {
-      await this.db.transaction(async (tx) => {
-        const batch = await tx
-          .select()
-          .from(outboxEvents)
-          .where(and(isNull(outboxEvents.processedAt), lt(outboxEvents.attempts, MAX_ATTEMPTS)))
-          .orderBy(outboxEvents.createdAt)
-          .limit(limit)
-          .for('update', { skipLocked: true });
-        for (const ev of batch) {
-          try {
-            await tx.transaction(async (sp) => this.handle(sp, ev.type as OutboxType, ev.payload as Payload));
-            await tx.update(outboxEvents).set({ processedAt: new Date(), attempts: ev.attempts + 1, lastError: null }).where(eq(outboxEvents.id, ev.id));
-            processed++;
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            this.logger.warn(`Event ${ev.id} (${ev.type}) failed: ${msg}`);
-            await tx.update(outboxEvents).set({ attempts: ev.attempts + 1, lastError: msg.slice(0, 500) }).where(eq(outboxEvents.id, ev.id));
-          }
-        }
-      });
+      for (let i = 0; i < limit; i++) {
+        const outcome = await this.dispatchOne();
+        if (outcome === 'empty') break;
+        if (outcome === 'ok') processed++;
+      }
     } catch (e) {
       this.logger.error(`Dispatch loop failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -84,14 +68,50 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
     return processed;
   }
 
+  private async dispatchOne(): Promise<'ok' | 'failed' | 'empty'> {
+    let claimed: { id: string; type: string; attempts: number } | undefined;
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        const r = await sql<{ id: string; type: string; payload: Payload; attempts: number }>`
+          SELECT TOP (1) id, type, payload, attempts
+          FROM outbox_events WITH (UPDLOCK, READPAST, ROWLOCK)
+          WHERE processed_at IS NULL AND attempts < ${MAX_ATTEMPTS}
+          ORDER BY created_at`.execute(trx);
+        const ev = r.rows[0];
+        if (!ev) return 'empty';
+        claimed = ev;
+        await this.handle(trx, ev.type as OutboxType, ev.payload);
+        await trx
+          .updateTable('outboxEvents')
+          .set({ processedAt: now(), attempts: ev.attempts + 1, lastError: null })
+          .where('id', '=', ev.id)
+          .execute();
+        return 'ok';
+      });
+    } catch (e) {
+      if (!claimed) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logger.warn(`Event ${claimed.id} (${claimed.type}) failed: ${msg}`);
+      await this.db
+        .updateTable('outboxEvents')
+        .set({ attempts: claimed.attempts + 1, lastError: msg.slice(0, 500) })
+        .where('id', '=', claimed.id)
+        .execute();
+      return 'failed';
+    }
+  }
+
   private async vendorUserIds(tx: Tx, vendorId: string) {
-    const rows = await tx.select({ userId: vendorMembers.userId }).from(vendorMembers).where(eq(vendorMembers.vendorId, vendorId));
+    const rows = await tx.selectFrom('vendorMembers').select('userId').where('vendorId', '=', vendorId).execute();
     return rows.map((r) => r.userId);
   }
 
   private async notify(tx: Tx, userIds: string[], n: { type: string; title: string; body: string; link?: string }) {
     if (userIds.length === 0) return;
-    await tx.insert(notifications).values(userIds.map((userId) => ({ userId, type: n.type, title: n.title, body: n.body, link: n.link ?? null })));
+    await tx
+      .insertInto('notifications')
+      .values(userIds.map((userId) => ({ userId, type: n.type, title: n.title, body: n.body, link: n.link ?? null })))
+      .execute();
   }
 
   private async handle(tx: Tx, type: OutboxType, p: Payload) {
@@ -128,7 +148,7 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
           link: `/quotes/${s('quoteId')}`,
         });
       case 'event_request.unmatched': {
-        const admins = await tx.select({ userId: userRoles.userId }).from(userRoles).where(eq(userRoles.role, 'ADMIN'));
+        const admins = await tx.selectFrom('userRoles').select('userId').where('role', '=', 'ADMIN').execute();
         return this.notify(
           tx,
           admins.map((a) => a.userId),
@@ -151,9 +171,7 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
       }
       case 'order.status_changed': {
         const body = `Booking ${s('orderNumber')} is now: ${label(s('toStatus'))}.`;
-        const targets: string[] = [];
-        if (s('actorRole') !== 'CUSTOMER') targets.push(s('customerId'));
-        await this.notify(tx, targets, { type, title: 'Booking update', body, link: `/orders/${s('orderId')}` });
+        if (s('actorRole') !== 'CUSTOMER') await this.notify(tx, [s('customerId')], { type, title: 'Booking update', body, link: `/orders/${s('orderId')}` });
         if (s('actorRole') !== 'VENDOR') {
           await this.notify(tx, await this.vendorUserIds(tx, s('vendorId')), { type, title: 'Booking update', body, link: `/orders/${s('orderId')}` });
         }
@@ -180,15 +198,17 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
   /** For admin monitoring: events that failed at least once and are not yet processed. */
   async failures(limit = 100) {
     return this.db
-      .select()
-      .from(outboxEvents)
-      .where(and(isNull(outboxEvents.processedAt), sql`${outboxEvents.attempts} > 0`))
-      .orderBy(outboxEvents.createdAt)
-      .limit(limit);
+      .selectFrom('outboxEvents')
+      .select(['id', 'type', 'attempts', 'lastError', 'createdAt'])
+      .where('processedAt', 'is', null)
+      .where('attempts', '>', 0)
+      .orderBy('createdAt')
+      .top(limit)
+      .execute();
   }
 
   async retry(ids: string[]) {
     if (ids.length === 0) return;
-    await this.db.update(outboxEvents).set({ attempts: 0 }).where(and(inArray(outboxEvents.id, ids), isNull(outboxEvents.processedAt)));
+    await this.db.updateTable('outboxEvents').set({ attempts: 0 }).where('id', 'in', ids).where('processedAt', 'is', null).execute();
   }
 }

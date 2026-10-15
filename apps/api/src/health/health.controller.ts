@@ -1,6 +1,5 @@
 import { Controller, Get, Inject } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { sql } from 'drizzle-orm';
 import { DB } from '../config';
 import type { Db } from '../db/client';
 import { Public } from '../auth/actor';
@@ -22,8 +21,8 @@ export class HealthController {
   @Get('ready')
   async ready() {
     try {
-      const r = await this.db.execute(sql`select count(*)::int as n from occasions`);
-      return { status: 'ready', database: 'ok', occasions: (r.rows[0] as { n: number }).n };
+      const r = await this.db.selectFrom('occasions').select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow();
+      return { status: 'ready', database: 'ok', occasions: r.n };
     } catch {
       throw new AppError(503, 'NOT_READY', 'Database unavailable');
     }

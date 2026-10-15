@@ -1,6 +1,6 @@
 # Architecture
 
-Utsavora is a **modular monolith**: one NestJS API, one PostgreSQL database, and three Next.js web apps that share TypeScript packages. There are no microservices; module boundaries inside the API are where future services would split if load ever demands it.
+Utsavora is a **modular monolith**: one NestJS API, one SQL Server database, and three Next.js web apps that share TypeScript packages. There are no microservices; module boundaries inside the API are where future services would split if load ever demands it.
 
 ```
                  ┌────────────── browsers ──────────────┐
@@ -13,14 +13,14 @@ Utsavora is a **modular monolith**: one NestJS API, one PostgreSQL database, and
      auth · catalogue · vendor · quotes(event requests) · orders · admin · notifications · health
                 │                                   │
                 ▼                                   ▼
-        PostgreSQL 16  ◄── transactional outbox ── background dispatcher (in-process)
+     SQL Server 2022  ◄── transactional outbox ── background dispatcher (in-process)
 ```
 
 ## Repository layout
 
 | Path | What it is |
 | --- | --- |
-| `apps/api` | NestJS API. `src/db/schema.ts` (Drizzle schema), `drizzle/` (SQL migrations), `test/` (end-to-end tests against PostgreSQL). |
+| `apps/api` | NestJS API. `migrations/*.sql` (T-SQL schema), `src/db/` (Kysely client, types, migration runner, seed), `test/` (end-to-end tests against SQL Server). |
 | `apps/customer-web` | Customer marketplace: browse, plan, request quotes, compare, accept, track bookings. |
 | `apps/vendor-portal` | Vendor onboarding, menus/packages, quote inbox and builder, bookings. |
 | `apps/admin-portal` | Dashboard, vendor verification, listing moderation, requests, booking queue + CSV, payments, commission, audit, alerts. |
@@ -34,7 +34,7 @@ Utsavora is a **modular monolith**: one NestJS API, one PostgreSQL database, and
 
 ## Key decisions
 
-**Drizzle instead of Prisma.** The brief prefers Prisma. The build environment could not download Prisma's engine binaries, so nothing could be migrated or tested with it. Drizzle is pure TypeScript, generates plain SQL migrations (`apps/api/drizzle/*.sql`) and supports the same relational modelling. Moving to Prisma later is a mechanical port: the tables, constraints and names are conventional snake_case.
+**SQL Server 2022 with Kysely.** The schema is hand-written T-SQL in `apps/api/migrations/`, applied in order by `pnpm db:migrate` and recorded in `dbo.schema_migrations`. Queries use Kysely (a typed SQL query builder) over the `tedious` driver, so what runs is plain, readable T-SQL; a few statements that need SQL Server hints are written as raw SQL. Table and column names are snake_case in the database and camelCase in TypeScript. The brief preferred PostgreSQL with Prisma; the team chose SQL Server because they already run it.
 
 **Same-origin API proxy + per-app cookies.** Each Next.js app rewrites `/api/*` to the API. Sessions are opaque random tokens in `httpOnly`, `SameSite=Lax` cookies (`uts_customer`, `uts_vendor`, `uts_admin`); only a SHA-256 hash is stored. The `x-utsavora-app` header picks which cookie is read, so one browser can be signed in to all three apps without sessions bleeding across, and because the header is mandatory on writes and CORS is closed, it also blocks CSRF.
 
@@ -42,9 +42,9 @@ Utsavora is a **modular monolith**: one NestJS API, one PostgreSQL database, and
 
 **Immutable quote revisions and order snapshots.** A quote is a thread (`quotes`) of immutable `quote_revisions` + `quote_items`. Accepting requires the exact revision id the customer saw (`QUOTE_REVISED` if the vendor changed it). The order stores the accepted revision, event, vendor and terms as a JSON `snapshot`, plus denormalised money columns for reporting.
 
-**Concurrency.** Accepting a quote runs in one transaction with `SELECT … FOR UPDATE` on the request and quote, then takes a PostgreSQL advisory lock keyed on `vendor + event date` before counting active bookings against the vendor's `max_events_per_day`. Unique constraints on `orders.event_request_id`, `quote_id` and `accepted_revision_id` are the final backstop against double-accepts. Tests fire concurrent accepts to verify.
+**Concurrency.** Accepting a quote runs in one transaction that reads the request and quote `WITH (UPDLOCK, ROWLOCK)`, then takes a transaction-scoped `sp_getapplock` on `vendor + event date` before counting active bookings against the vendor's `max_events_per_day`. Filtered unique indexes on `orders.event_request_id`, `quote_id` and `accepted_revision_id` are the final backstop against double-accepts. The database runs with `READ_COMMITTED_SNAPSHOT` so plain reads never wait on bookings in progress. Tests fire concurrent accepts to verify.
 
-**Transactional outbox.** Business transactions insert `outbox_events` rows; an in-process dispatcher (`SKIP LOCKED`, retries, failure tracking) turns them into in-app notifications. Email/SMS/WhatsApp channels plug in here later without touching business code. Admins can see and retry failures.
+**Transactional outbox.** Business transactions insert `outbox_events` rows; an in-process dispatcher (claims rows `WITH (UPDLOCK, READPAST)`, retries, failure tracking) turns them into in-app notifications. Email/SMS/WhatsApp channels plug in here later without touching business code. Admins can see and retry failures.
 
 **IST calendar.** Event dates are `date` columns compared against "today" in India Standard Time.
 

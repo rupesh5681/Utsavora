@@ -9,7 +9,7 @@ RUN pnpm install --frozen-lockfile --filter @utsavora/api...
 RUN pnpm --filter @utsavora/types --filter @utsavora/validation build \
  && pnpm --filter @utsavora/api build \
  && pnpm --filter @utsavora/api deploy --legacy --prod /out \
- && cp -r apps/api/dist /out/dist && cp -r apps/api/drizzle /out/drizzle
+ && cp -r apps/api/dist /out/dist && cp -r apps/api/migrations /out/migrations
 
 FROM node:22-bookworm-slim
 ENV NODE_ENV=production PORT=4000

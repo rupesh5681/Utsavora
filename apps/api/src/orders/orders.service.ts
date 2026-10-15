@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, gte, ilike, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
+import type { Expression, SqlBool } from 'kysely';
 import {
   ACTIVE_ORDER_STATUSES,
   availableActions,
@@ -13,36 +13,16 @@ import {
 } from '@utsavora/types';
 import type { OrderActionInput, OrderListQuery, RecordPaymentInput } from '@utsavora/validation';
 import { DB } from '../config';
-import type { Db, Tx } from '../db/client';
-import {
-  categories,
-  commissionRules,
-  eventRequestCategories,
-  eventRequests,
-  occasions,
-  orderEvents,
-  orders,
-  payments,
-  quoteItems,
-  quoteRevisions,
-  quotes,
-  serviceAreas,
-  users,
-  vendorCategories,
-  vendors,
-} from '../db/schema';
+import { json, lockRow, now, sql, type Db, type DbOrTx, type Tx } from '../db/client';
+import type { EventRequest, Quote, QuoteItem, QuoteRevision, Vendor } from '../db/types';
 import { conflict, forbidden, notFound, unprocessable } from '../common/errors';
 import { AuditService } from '../common/audit.service';
 import { OutboxService } from '../common/outbox.service';
+import { likeContains } from '../catalog/catalog.service';
 import { orderNumber } from '../common/ids';
 import { addDays, todayIST } from '../common/time';
 import { Page } from '../common/page';
 import type { Actor } from '../auth/actor';
-
-type RequestRow = typeof eventRequests.$inferSelect;
-type QuoteRow = typeof quotes.$inferSelect;
-type RevisionRow = typeof quoteRevisions.$inferSelect & { items: (typeof quoteItems.$inferSelect)[] };
-type VendorRow = typeof vendors.$inferSelect;
 
 export interface OrderSnapshot {
   version: 1;
@@ -85,6 +65,8 @@ export interface OrderSnapshot {
   commission: { bps: number; basis: 'taxable_value'; commissionPaise: number; vendorPayablePaise: number };
 }
 
+const PAYABLE_STATUSES: OrderStatus[] = ['PAYMENT_PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED'];
+
 @Injectable()
 export class OrdersService {
   constructor(
@@ -94,45 +76,46 @@ export class OrdersService {
   ) {}
 
   /** vendor-specific rule > category rule > platform default. */
-  async resolveCommissionBps(tx: Tx | Db, vendorId: string, eventRequestId: string): Promise<number> {
-    const vendorRule = await tx
-      .select()
-      .from(commissionRules)
-      .where(and(eq(commissionRules.vendorId, vendorId), isNull(commissionRules.categoryId)));
-    if (vendorRule[0]) return vendorRule[0].bps;
+  async resolveCommissionBps(tx: DbOrTx, vendorId: string, eventRequestId: string): Promise<number> {
+    const vendorRule = await tx.selectFrom('commissionRules').select('bps').where('vendorId', '=', vendorId).where('categoryId', 'is', null).executeTakeFirst();
+    if (vendorRule) return vendorRule.bps;
     // Primary category = the first (by catalogue order) requested category this vendor offers.
-    const [primary] = await tx
-      .select({ id: categories.id })
-      .from(eventRequestCategories)
-      .innerJoin(categories, eq(categories.id, eventRequestCategories.categoryId))
-      .innerJoin(vendorCategories, and(eq(vendorCategories.categoryId, categories.id), eq(vendorCategories.vendorId, vendorId)))
-      .where(eq(eventRequestCategories.eventRequestId, eventRequestId))
-      .orderBy(asc(categories.sortOrder))
-      .limit(1);
+    const primary = await tx
+      .selectFrom('eventRequestCategories')
+      .innerJoin('categories', 'categories.id', 'eventRequestCategories.categoryId')
+      .innerJoin('vendorCategories', (j) => j.onRef('vendorCategories.categoryId', '=', 'categories.id').on('vendorCategories.vendorId', '=', vendorId))
+      .select('categories.id')
+      .where('eventRequestCategories.eventRequestId', '=', eventRequestId)
+      .orderBy('categories.sortOrder')
+      .top(1)
+      .executeTakeFirst();
     if (primary) {
-      const catRule = await tx
-        .select()
-        .from(commissionRules)
-        .where(and(isNull(commissionRules.vendorId), eq(commissionRules.categoryId, primary.id)));
-      if (catRule[0]) return catRule[0].bps;
+      const catRule = await tx.selectFrom('commissionRules').select('bps').where('vendorId', 'is', null).where('categoryId', '=', primary.id).executeTakeFirst();
+      if (catRule) return catRule.bps;
     }
-    const def = await tx
-      .select()
-      .from(commissionRules)
-      .where(and(isNull(commissionRules.vendorId), isNull(commissionRules.categoryId)));
-    return def[0]?.bps ?? 1000;
+    const def = await tx.selectFrom('commissionRules').select('bps').where('vendorId', 'is', null).where('categoryId', 'is', null).executeTakeFirst();
+    return def?.bps ?? 1000;
   }
 
-  /** Must be called inside the accept-quote transaction. */
-  async createFromAcceptedQuote(tx: Tx, actor: Actor, ctx: { request: RequestRow; quote: QuoteRow; revision: RevisionRow; vendor: VendorRow }) {
-    const { request, quote, revision, vendor } = ctx;
+  /**
+   * Must be called inside the accept-quote transaction, which must already hold the
+   * vendor-day application lock (vendorDayLockKey) taken before any row locks.
+   */
+  async createFromAcceptedQuote(
+    tx: Tx,
+    actor: Actor,
+    ctx: { request: EventRequest; quote: Quote; revision: QuoteRevision; items: QuoteItem[]; vendor: Vendor },
+  ) {
+    const { request, quote, revision, items, vendor } = ctx;
 
-    // Serialise capacity checks per vendor per date, then count active bookings.
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`${vendor.id}:${request.eventDate}`}, 0))`);
-    const [{ booked }] = await tx
-      .select({ booked: sql<number>`count(*)::int` })
-      .from(orders)
-      .where(and(eq(orders.vendorId, vendor.id), eq(orders.eventDate, request.eventDate), inArray(orders.status, ACTIVE_ORDER_STATUSES)));
+    // Count active bookings; the caller's vendor-day lock serialises this check.
+    const { booked } = await tx
+      .selectFrom('orders')
+      .select((eb) => eb.fn.countAll<number>().as('booked'))
+      .where('vendorId', '=', vendor.id)
+      .where('eventDate', '=', request.eventDate)
+      .where('status', 'in', ACTIVE_ORDER_STATUSES)
+      .executeTakeFirstOrThrow();
     if (booked >= vendor.maxEventsPerDay) {
       throw conflict('VENDOR_FULLY_BOOKED', `${vendor.businessName} is fully booked on ${request.eventDate}. Please choose another quote.`);
     }
@@ -141,14 +124,17 @@ export class OrdersService {
     const taxable = revision.subtotalPaise - revision.discountPaise;
     const { commissionPaise, vendorPayablePaise } = computeCommission(taxable, revision.totalPaise, bps);
 
-    const [occ] = await tx.select().from(occasions).where(eq(occasions.id, request.occasionId));
-    const [area] = await tx.select().from(serviceAreas).where(eq(serviceAreas.id, request.serviceAreaId));
+    // Sequential on purpose: a transaction holds one connection, and tedious runs one request at a time.
+    const occ = await tx.selectFrom('occasions').select('name').where('id', '=', request.occasionId).executeTakeFirstOrThrow();
+    const area = await tx.selectFrom('serviceAreas').select(['name', 'city']).where('id', '=', request.serviceAreaId).executeTakeFirstOrThrow();
     const services = await tx
-      .select({ name: categories.name })
-      .from(eventRequestCategories)
-      .innerJoin(categories, eq(categories.id, eventRequestCategories.categoryId))
-      .where(eq(eventRequestCategories.eventRequestId, request.id));
-    const [customer] = await tx.select({ id: users.id, name: users.name }).from(users).where(eq(users.id, request.customerId));
+      .selectFrom('eventRequestCategories')
+      .innerJoin('categories', 'categories.id', 'eventRequestCategories.categoryId')
+      .select('categories.name')
+      .where('eventRequestCategories.eventRequestId', '=', request.id)
+      .orderBy('categories.sortOrder')
+      .execute();
+    const customer = await tx.selectFrom('users').select(['id', 'name']).where('id', '=', request.customerId).executeTakeFirstOrThrow();
 
     const snapshot: OrderSnapshot = {
       version: 1,
@@ -173,7 +159,7 @@ export class OrdersService {
         quoteId: quote.id,
         revisionId: revision.id,
         revisionNumber: revision.revisionNumber,
-        items: revision.items.map((i) => ({ description: i.description, quantity: i.quantity, unitPricePaise: i.unitPricePaise, lineTotalPaise: i.lineTotalPaise })),
+        items: items.map((i) => ({ description: i.description, quantity: i.quantity, unitPricePaise: i.unitPricePaise, lineTotalPaise: i.lineTotalPaise })),
         subtotalPaise: revision.subtotalPaise,
         discountPaise: revision.discountPaise,
         taxBps: revision.taxBps,
@@ -191,8 +177,9 @@ export class OrdersService {
       commission: { bps, basis: 'taxable_value', commissionPaise, vendorPayablePaise },
     };
 
-    const [order] = await tx
-      .insert(orders)
+    const order = await tx
+      .insertInto('orders')
+      .output(['inserted.id', 'inserted.orderNumber'])
       .values({
         orderNumber: orderNumber(request.eventDate),
         mode: 'QUOTE',
@@ -213,114 +200,115 @@ export class OrdersService {
         commissionBps: bps,
         commissionPaise,
         vendorPayablePaise,
-        snapshot,
+        snapshot: json(snapshot),
         isDemo: vendor.isDemo,
+        cancelReason: null,
       })
-      .returning();
-    await tx.insert(orderEvents).values({
-      orderId: order.id,
-      actorId: actor.userId,
-      actorRole: actor.role,
-      action: 'quote_accepted',
-      fromStatus: null,
-      toStatus: 'PENDING_CONFIRMATION',
-      note: `Accepted quote revision ${revision.revisionNumber}`,
-    });
+      .executeTakeFirstOrThrow();
+    await this.event(tx, actor, order.id, 'quote_accepted', null, 'PENDING_CONFIRMATION', `Accepted quote revision ${revision.revisionNumber}`);
     await this.outbox.enqueue(tx, 'order.created', { orderId: order.id, orderNumber: order.orderNumber, vendorId: vendor.id, customerId: request.customerId });
     return order;
   }
 
-  async findByEventRequest(id: string) {
-    return this.db.query.orders.findFirst({ where: eq(orders.eventRequestId, id), columns: { id: true, orderNumber: true, status: true } });
+  findByEventRequest(id: string) {
+    return this.db.selectFrom('orders').select(['id', 'orderNumber', 'status']).where('eventRequestId', '=', id).executeTakeFirst();
   }
 
-  async findByQuote(id: string) {
-    return this.db.query.orders.findFirst({ where: eq(orders.quoteId, id), columns: { id: true, orderNumber: true, status: true } });
+  findByQuote(id: string) {
+    return this.db.selectFrom('orders').select(['id', 'orderNumber', 'status']).where('quoteId', '=', id).executeTakeFirst();
   }
 
-  private scope(actor: Actor): SQL | undefined {
-    if (actor.role === 'CUSTOMER') return eq(orders.customerId, actor.userId);
-    if (actor.role === 'VENDOR') {
+  /** Base query for order lists, scoped to the caller and filtered. */
+  private listBase(actor: Actor, q: Partial<OrderListQuery>) {
+    let base = this.db
+      .selectFrom('orders')
+      .innerJoin('vendors', 'vendors.id', 'orders.vendorId')
+      .innerJoin('users', 'users.id', 'orders.customerId');
+    if (actor.role === 'CUSTOMER') base = base.where('orders.customerId', '=', actor.userId);
+    else if (actor.role === 'VENDOR') {
       if (!actor.vendorId) throw forbidden();
-      return eq(orders.vendorId, actor.vendorId);
-    }
-    if (!actor.permissions.includes('ORDERS_MANAGE')) throw forbidden('Missing admin permission: ORDERS_MANAGE');
-    return undefined;
-  }
-
-  private filters(q: Partial<OrderListQuery>): SQL[] {
-    const c: SQL[] = [];
-    if (q.status) c.push(eq(orders.status, q.status));
-    if (q.from) c.push(gte(orders.eventDate, q.from));
-    if (q.to) c.push(lte(orders.eventDate, q.to));
+      base = base.where('orders.vendorId', '=', actor.vendorId);
+    } else if (!actor.permissions.includes('ORDERS_MANAGE')) throw forbidden('Missing admin permission: ORDERS_MANAGE');
+    if (q.status) base = base.where('orders.status', '=', q.status);
+    if (q.from) base = base.where('orders.eventDate', '>=', q.from);
+    if (q.to) base = base.where('orders.eventDate', '<=', q.to);
     if (q.q) {
-      const term = `%${q.q.replace(/[\\%_]/g, (x) => `\\${x}`)}%`;
-      c.push(or(ilike(orders.orderNumber, term), ilike(vendors.businessName, term), ilike(users.name, term))!);
+      const term = likeContains(q.q);
+      base = base.where((eb) =>
+        eb.or(
+          (['orders.orderNumber', 'vendors.businessName', 'users.name'] as const).map(
+            (col) => sql<SqlBool>`${eb.ref(col)} LIKE ${term} ESCAPE '\\'` as Expression<SqlBool>,
+          ),
+        ),
+      );
     }
-    return c;
+    return base;
   }
 
-  private listColumns = {
-    id: orders.id,
-    orderNumber: orders.orderNumber,
-    status: orders.status,
-    eventDate: orders.eventDate,
-    guestCount: orders.guestCount,
-    totalPaise: orders.totalPaise,
-    advancePaise: orders.advancePaise,
-    paidPaise: orders.paidPaise,
-    commissionPaise: orders.commissionPaise,
-    vendorPayablePaise: orders.vendorPayablePaise,
-    isDemo: orders.isDemo,
-    createdAt: orders.createdAt,
-    occasion: sql<string>`${orders.snapshot} -> 'event' ->> 'occasion'`,
-    area: sql<string>`${orders.snapshot} -> 'event' ->> 'area'`,
-    vendor: { id: vendors.id, businessName: vendors.businessName },
-    customer: { id: users.id, name: users.name },
-  };
+  private listSelect(actor: Actor, q: Partial<OrderListQuery>) {
+    return this.listBase(actor, q).select([
+      'orders.id',
+      'orders.orderNumber',
+      'orders.status',
+      'orders.eventDate',
+      'orders.guestCount',
+      'orders.totalPaise',
+      'orders.advancePaise',
+      'orders.paidPaise',
+      'orders.commissionPaise',
+      'orders.vendorPayablePaise',
+      'orders.isDemo',
+      'orders.createdAt',
+      sql<string>`JSON_VALUE(orders.snapshot, '$.event.occasion')`.as('occasion'),
+      sql<string>`JSON_VALUE(orders.snapshot, '$.event.area')`.as('area'),
+      'vendors.id as vendorId',
+      'vendors.businessName as vendorName',
+      'users.id as customerId',
+      'users.name as customerName',
+    ]);
+  }
 
   async list(actor: Actor, q: OrderListQuery) {
-    const where = and(this.scope(actor), ...this.filters(q));
-    const base = this.db
-      .select(this.listColumns)
-      .from(orders)
-      .innerJoin(vendors, eq(vendors.id, orders.vendorId))
-      .innerJoin(users, eq(users.id, orders.customerId))
-      .where(where);
-    const [items, [{ total }]] = await Promise.all([
-      base
-        .orderBy(asc(orders.eventDate), desc(orders.createdAt))
-        .limit(q.pageSize)
-        .offset((q.page - 1) * q.pageSize),
-      this.db
-        .select({ total: sql<number>`count(*)::int` })
-        .from(orders)
-        .innerJoin(vendors, eq(vendors.id, orders.vendorId))
-        .innerJoin(users, eq(users.id, orders.customerId))
-        .where(where),
+    const [rows, total] = await Promise.all([
+      this.listSelect(actor, q)
+        .orderBy('orders.eventDate')
+        .orderBy('orders.createdAt', 'desc')
+        .orderBy('orders.id')
+        .offset((q.page - 1) * q.pageSize)
+        .fetch(q.pageSize)
+        .execute(),
+      this.listBase(actor, q)
+        .select((eb) => eb.fn.countAll<number>().as('n'))
+        .executeTakeFirstOrThrow(),
     ]);
-    // Vendors and customers don't need each other's internal financial split.
-    const visible = actor.role === 'CUSTOMER' ? items.map(({ commissionPaise: _c, vendorPayablePaise: _v, ...rest }) => rest) : items;
-    return new Page(visible, q.page, q.pageSize, total);
+    const items = rows.map(({ vendorId, vendorName, customerId, customerName, commissionPaise, vendorPayablePaise, ...r }) => ({
+      ...r,
+      vendor: { id: vendorId, businessName: vendorName },
+      customer: { id: customerId, name: customerName },
+      // Customers don't see the platform's internal financial split.
+      ...(actor.role === 'CUSTOMER' ? {} : { commissionPaise, vendorPayablePaise }),
+    }));
+    return new Page(items, q.page, q.pageSize, total.n);
   }
 
-  /** Full rows for CSV export (admin only, capped). */
+  /** Full rows for CSV export (admin only, capped at 10,000). */
   async exportRows(actor: Actor, q: Partial<OrderListQuery>) {
-    const where = and(this.scope(actor), ...this.filters(q));
-    return this.db
-      .select({
-        ...this.listColumns,
-        customerEmail: users.email,
-        customerPhone: users.phone,
-        vendorPhone: vendors.phone,
-        eventReference: sql<string>`${orders.snapshot} -> 'event' ->> 'reference'`,
-      })
-      .from(orders)
-      .innerJoin(vendors, eq(vendors.id, orders.vendorId))
-      .innerJoin(users, eq(users.id, orders.customerId))
-      .where(where)
-      .orderBy(asc(orders.eventDate))
-      .limit(10_000);
+    const rows = await this.listSelect(actor, q)
+      .select([
+        'users.email as customerEmail',
+        'users.phone as customerPhone',
+        'vendors.phone as vendorPhone',
+        sql<string>`JSON_VALUE(orders.snapshot, '$.event.reference')`.as('eventReference'),
+      ])
+      .orderBy('orders.eventDate')
+      .orderBy('orders.id')
+      .top(10_000)
+      .execute();
+    return rows.map(({ vendorId, vendorName, customerId, customerName, ...r }) => ({
+      ...r,
+      vendor: { id: vendorId, businessName: vendorName },
+      customer: { id: customerId, name: customerName },
+    }));
   }
 
   private stateActor(actor: Actor): StateActor {
@@ -328,20 +316,18 @@ export class OrdersService {
   }
 
   async detail(actor: Actor, id: string) {
-    const o = await this.db.query.orders.findFirst({
-      where: eq(orders.id, id),
-      with: {
-        events: { orderBy: [asc(orderEvents.createdAt)] },
-        payments: { orderBy: [asc(payments.createdAt)] },
-        vendor: { columns: { id: true, businessName: true, phone: true, slug: true, isDemo: true } },
-        customer: { columns: { id: true, name: true, phone: true, email: true } },
-      },
-    });
+    const o = await this.db.selectFrom('orders').selectAll().where('id', '=', id).executeTakeFirst();
     if (!o) throw notFound('Order');
     if (actor.role === 'CUSTOMER' && o.customerId !== actor.userId) throw notFound('Order');
     if (actor.role === 'VENDOR' && o.vendorId !== actor.vendorId) throw notFound('Order');
     if (actor.role === 'ADMIN' && !actor.permissions.includes('ORDERS_MANAGE')) throw forbidden('Missing admin permission: ORDERS_MANAGE');
 
+    const [events, pays, vendor, customer] = await Promise.all([
+      this.db.selectFrom('orderEvents').selectAll().where('orderId', '=', id).orderBy('createdAt').orderBy('id').execute(),
+      this.db.selectFrom('payments').selectAll().where('orderId', '=', id).orderBy('createdAt').orderBy('id').execute(),
+      this.db.selectFrom('vendors').select(['id', 'businessName', 'phone', 'slug', 'isDemo']).where('id', '=', o.vendorId).executeTakeFirstOrThrow(),
+      this.db.selectFrom('users').select(['id', 'name', 'phone', 'email']).where('id', '=', o.customerId).executeTakeFirstOrThrow(),
+    ]);
     const snapshot = o.snapshot as OrderSnapshot;
     const base = {
       id: o.id,
@@ -364,9 +350,9 @@ export class OrdersService {
       cancelReason: o.cancelReason,
       createdAt: o.createdAt,
       snapshot: { ...snapshot, commission: undefined },
-      vendor: o.vendor,
-      timeline: o.events.map((e) => ({ id: e.id, action: e.action, actorRole: e.actorRole, fromStatus: e.fromStatus, toStatus: e.toStatus, note: e.note, createdAt: e.createdAt })),
-      payments: o.payments.map((p) => ({
+      vendor,
+      timeline: events.map((e) => ({ id: e.id, action: e.action, actorRole: e.actorRole, fromStatus: e.fromStatus, toStatus: e.toStatus, note: e.note, createdAt: e.createdAt })),
+      payments: pays.map((p) => ({
         id: p.id,
         provider: p.provider,
         kind: p.kind,
@@ -378,22 +364,17 @@ export class OrdersService {
         reference: actor.role === 'ADMIN' ? p.reference : undefined,
       })),
       actions: availableActions(ORDER_TRANSITIONS, o.status, this.stateActor(actor)).filter((a) => a !== 'record_advance'),
-      canRecordPayment: actor.role === 'ADMIN' && actor.permissions.includes('PAYMENTS_RECORD') && ['PAYMENT_PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED'].includes(o.status) && o.paidPaise < o.totalPaise,
+      canRecordPayment:
+        actor.role === 'ADMIN' && actor.permissions.includes('PAYMENTS_RECORD') && PAYABLE_STATUSES.includes(o.status) && o.paidPaise < o.totalPaise,
     };
-    if (actor.role === 'CUSTOMER') return { ...base, customer: { id: o.customer.id, name: o.customer.name } };
-    return {
-      ...base,
-      customer: o.customer,
-      commissionBps: o.commissionBps,
-      commissionPaise: o.commissionPaise,
-      vendorPayablePaise: o.vendorPayablePaise,
-    };
+    if (actor.role === 'CUSTOMER') return { ...base, customer: { id: customer.id, name: customer.name } };
+    return { ...base, customer, commissionBps: o.commissionBps, commissionPaise: o.commissionPaise, vendorPayablePaise: o.vendorPayablePaise };
   }
 
   async act(actor: Actor, id: string, input: OrderActionInput) {
     if (actor.role === 'ADMIN' && !actor.permissions.includes('ORDERS_MANAGE')) throw forbidden('Missing admin permission: ORDERS_MANAGE');
-    await this.db.transaction(async (tx) => {
-      const [o] = await tx.select().from(orders).where(eq(orders.id, id)).for('update');
+    await this.db.transaction().execute(async (tx) => {
+      const o = await lockRow(tx, 'orders', id);
       if (!o) throw notFound('Order');
       if (actor.role === 'CUSTOMER' && o.customerId !== actor.userId) throw notFound('Order');
       if (actor.role === 'VENDOR' && o.vendorId !== actor.vendorId) throw notFound('Order');
@@ -407,15 +388,17 @@ export class OrdersService {
       if (t.to === 'CANCELLED' && actor.role !== 'CUSTOMER' && !input.reason) {
         throw unprocessable('REASON_REQUIRED', 'Please give a reason for cancelling.');
       }
+      let reason = input.reason;
       if (t.to === 'CANCELLED' && o.paidPaise > 0) {
         // Refund handling arrives with online payments; flag for ops in the timeline and audit log.
-        input.reason = `${input.reason ? `${input.reason}. ` : ''}${formatINR(o.paidPaise)} already paid; Utsavora will process the refund.`;
+        reason = `${reason ? `${reason}. ` : ''}${formatINR(o.paidPaise)} already paid; Utsavora will process the refund.`;
       }
       await tx
-        .update(orders)
-        .set({ status: t.to, cancelReason: t.to === 'CANCELLED' ? input.reason || 'Cancelled by customer' : o.cancelReason })
-        .where(eq(orders.id, id));
-      await this.event(tx, actor, id, input.action, o.status, t.to, input.reason);
+        .updateTable('orders')
+        .set({ status: t.to, cancelReason: t.to === 'CANCELLED' ? reason || 'Cancelled by customer' : o.cancelReason, updatedAt: now() })
+        .where('id', '=', id)
+        .execute();
+      await this.event(tx, actor, id, input.action, o.status, t.to, reason);
       await this.outbox.enqueue(tx, 'order.status_changed', {
         orderId: id,
         orderNumber: o.orderNumber,
@@ -424,13 +407,13 @@ export class OrdersService {
         customerId: o.customerId,
         actorRole: actor.role,
       });
-      await this.audit.record(actor, { action: `order.${input.action}`, entityType: 'order', entityId: id, metadata: { from: o.status, to: t.to, reason: input.reason } }, tx);
+      await this.audit.record(actor, { action: `order.${input.action}`, entityType: 'order', entityId: id, metadata: { from: o.status, to: t.to, reason } }, tx);
     });
     return this.detail(actor, id);
   }
 
-  private event(tx: Tx, actor: Actor, orderId: string, action: string, from: OrderStatus | null, to: OrderStatus, note = '') {
-    return tx.insert(orderEvents).values({ orderId, actorId: actor.userId, actorRole: actor.role, action, fromStatus: from, toStatus: to, note });
+  private async event(tx: Tx, actor: Actor, orderId: string, action: string, from: OrderStatus | null, to: OrderStatus, note = '') {
+    await tx.insertInto('orderEvents').values({ orderId, actorId: actor.userId, actorRole: actor.role, action, fromStatus: from, toStatus: to, note }).execute();
   }
 
   /**
@@ -441,52 +424,58 @@ export class OrdersService {
   async recordPayment(actor: Actor, id: string, input: RecordPaymentInput) {
     if (!actor.permissions.includes('PAYMENTS_RECORD')) throw forbidden('Missing admin permission: PAYMENTS_RECORD');
     if (input.receivedOn > todayIST()) throw unprocessable('INVALID_DATE', 'Payment date cannot be in the future.');
-    await this.db.transaction(async (tx) => {
-      const [o] = await tx.select().from(orders).where(eq(orders.id, id)).for('update');
+    await this.db.transaction().execute(async (tx) => {
+      const o = await lockRow(tx, 'orders', id);
       if (!o) throw notFound('Order');
-      if (!['PAYMENT_PENDING', 'CONFIRMED', 'IN_PROGRESS', 'COMPLETED'].includes(o.status)) {
+      if (!PAYABLE_STATUSES.includes(o.status)) {
         throw conflict('PAYMENT_NOT_EXPECTED', 'Payments can be recorded only after the vendor confirms the booking.');
       }
       const outstanding = o.totalPaise - o.paidPaise;
-      if (input.amountPaise > outstanding) throw unprocessable('OVERPAYMENT', `Amount exceeds the outstanding balance of ₹${(outstanding / 100).toFixed(2)}.`);
+      if (input.amountPaise > outstanding) throw unprocessable('OVERPAYMENT', `Amount exceeds the outstanding balance of ${formatINR(outstanding)}.`);
       const idempotencyKey = `manual:${input.method}:${input.reference.trim().toUpperCase()}`;
-      const dupe = await tx.select({ id: payments.id }).from(payments).where(eq(payments.idempotencyKey, idempotencyKey));
-      if (dupe.length) throw conflict('DUPLICATE_PAYMENT', 'A payment with this method and reference is already recorded.');
+      const dupe = await tx.selectFrom('payments').select('id').where('idempotencyKey', '=', idempotencyKey).executeTakeFirst();
+      if (dupe) throw conflict('DUPLICATE_PAYMENT', 'A payment with this method and reference is already recorded.');
       const paid = o.paidPaise + input.amountPaise;
       const kind = o.status === 'PAYMENT_PENDING' ? (paid >= o.totalPaise ? 'FULL' : 'ADVANCE') : 'BALANCE';
-      await tx.insert(payments).values({
-        orderId: id,
-        provider: 'MANUAL',
-        kind,
-        status: 'SUCCEEDED',
-        method: input.method,
-        amountPaise: input.amountPaise,
-        reference: input.reference,
-        idempotencyKey,
-        receivedOn: input.receivedOn,
-        notes: input.notes,
-        recordedById: actor.userId,
-      });
+      await tx
+        .insertInto('payments')
+        .values({
+          orderId: id,
+          provider: 'MANUAL',
+          kind,
+          status: 'SUCCEEDED',
+          method: input.method,
+          amountPaise: input.amountPaise,
+          reference: input.reference,
+          idempotencyKey,
+          receivedOn: input.receivedOn,
+          notes: input.notes,
+          recordedById: actor.userId,
+        })
+        .execute();
       let status = o.status;
       if (o.status === 'PAYMENT_PENDING' && paid >= o.advancePaise) {
         const t = canTransition(ORDER_TRANSITIONS, 'record_advance', o.status, 'ADMIN');
         if (t.ok) status = t.to;
       }
-      await tx.update(orders).set({ paidPaise: paid, status }).where(eq(orders.id, id));
-      await this.event(
-        tx,
-        actor,
-        id,
-        'payment_recorded',
-        o.status,
-        status,
-        `${formatINR(input.amountPaise)} by ${label(input.method)}, verified by Utsavora`,
-      );
+      await tx.updateTable('orders').set({ paidPaise: paid, status, updatedAt: now() }).where('id', '=', id).execute();
+      await this.event(tx, actor, id, 'payment_recorded', o.status, status, `${formatINR(input.amountPaise)} by ${label(input.method)}, verified by Utsavora`);
       await this.outbox.enqueue(tx, 'payment.recorded', { orderId: id, orderNumber: o.orderNumber, vendorId: o.vendorId, customerId: o.customerId });
       if (status !== o.status) {
-        await this.outbox.enqueue(tx, 'order.status_changed', { orderId: id, orderNumber: o.orderNumber, toStatus: status, vendorId: o.vendorId, customerId: o.customerId, actorRole: 'ADMIN' });
+        await this.outbox.enqueue(tx, 'order.status_changed', {
+          orderId: id,
+          orderNumber: o.orderNumber,
+          toStatus: status,
+          vendorId: o.vendorId,
+          customerId: o.customerId,
+          actorRole: 'ADMIN',
+        });
       }
-      await this.audit.record(actor, { action: 'payment.recorded', entityType: 'order', entityId: id, metadata: { amountPaise: input.amountPaise, method: input.method, reference: input.reference } }, tx);
+      await this.audit.record(
+        actor,
+        { action: 'payment.recorded', entityType: 'order', entityId: id, metadata: { amountPaise: input.amountPaise, method: input.method, reference: input.reference } },
+        tx,
+      );
     });
     return this.detail(actor, id);
   }
