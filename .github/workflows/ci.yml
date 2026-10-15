@@ -57,6 +57,30 @@ jobs:
           kill $API_PID
       - name: Build web apps
         run: pnpm --filter @utsavora/customer-web --filter @utsavora/vendor-portal --filter @utsavora/admin-portal build
+  e2e-repeat:  # TEMPORARY: checks the SQL Server e2e suite for flakiness; remove before merging
+    if: github.ref == 'refs/heads/sqlserver'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { run: [1, 2, 3, 4, 5, 6] }
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env: { ACCEPT_EULA: "Y", MSSQL_PID: Developer, MSSQL_SA_PASSWORD: Utsavora-Test-2026! }
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Utsavora-Test-2026!' -Q 'SELECT 1' -b -o /dev/null"
+          --health-interval 10s --health-timeout 5s --health-retries 20 --health-start-period 20s
+    env:
+      TEST_DATABASE_URL: Server=localhost,1433;Database=utsavora_test;User Id=sa;Password=Utsavora-Test-2026!;Encrypt=false;TrustServerCertificate=true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "./packages/**" -r build
+      - run: .github/scripts/annotate-on-failure.sh pnpm --filter @utsavora/api exec jest --runInBand --selectProjects e2e --ci
   images:
     needs: verify
     if: github.ref == 'refs/heads/main'
