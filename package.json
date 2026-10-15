@@ -12,7 +12,7 @@
     "dev:customer": "pnpm --filter @utsavora/customer-web dev",
     "dev:vendor": "pnpm --filter @utsavora/vendor-portal dev",
     "dev:admin": "pnpm --filter @utsavora/admin-portal dev",
-    "db:migrate": "pnpm --filter @utsavora/api prisma:migrate",
+    "db:migrate": "pnpm --filter @utsavora/api db:migrate",
     "db:seed": "pnpm --filter @utsavora/api seed"
   }
 }
