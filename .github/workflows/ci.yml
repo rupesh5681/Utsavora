@@ -46,9 +46,8 @@ jobs:
         run: |
           docker exec ${{ job.services.mssql.id }} /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Utsavora-Test-2026!' -b -Q "CREATE DATABASE utsavora_ci"
           pnpm build
-          node dist/db/migrate.js
+          (cd ../.. && pnpm db:migrate && pnpm db:seed)   # the documented root shortcuts
           node dist/db/migrate.js | grep "up to date"
-          node dist/db/seed.js
           node dist/db/seed.js
           NODE_ENV=production node dist/main.js & API_PID=$!
           sleep 6
