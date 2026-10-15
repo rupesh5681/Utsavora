@@ -1,29 +1,17 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, gte, inArray, isNull, sql, type SQL } from 'drizzle-orm';
 import { canTransition, LISTING_TRANSITIONS, VENDOR_TRANSITIONS, ACTIVE_ORDER_STATUSES, formatINR, label } from '@utsavora/types';
 import type { CommissionSettingsInput, ModerationDecisionInput } from '@utsavora/validation';
 import { DB } from '../config';
-import type { Db } from '../db/client';
-import {
-  auditLogs,
-  categories,
-  commissionRules,
-  eventRequests,
-  listings,
-  moderationActions,
-  orders,
-  quotes,
-  users,
-  vendorMembers,
-  vendors,
-  vendorVerificationReviews,
-} from '../db/schema';
+import { lockRow, now, sql, type Db } from '../db/client';
+import type { Listing, Vendor } from '../db/types';
 import { conflict, notFound, unprocessable } from '../common/errors';
 import { AuditService } from '../common/audit.service';
 import { Page } from '../common/page';
 import { todayIST, addDays } from '../common/time';
 import { vendorChecklist } from '../vendor/vendor.service';
 import type { Actor } from '../auth/actor';
+
+const count = (n: { n: number } | undefined) => n?.n ?? 0;
 
 @Injectable()
 export class AdminService {
@@ -34,48 +22,67 @@ export class AdminService {
 
   async dashboard() {
     const today = todayIST();
-    const count = (table: typeof vendors | typeof listings | typeof eventRequests, where?: SQL) =>
+    const countAll = <T extends 'vendors' | 'listings' | 'eventRequests'>(table: T, status: string) =>
       this.db
-        .select({ n: sql<number>`count(*)::int` })
-        .from(table)
-        .where(where)
-        .then((r) => r[0].n);
-    const [vendorsPending, listingsPending, openRequests, vendorsApproved, ordersByStatus, [money], [upcoming], [unquoted]] = await Promise.all([
-      count(vendors, eq(vendors.status, 'PENDING_REVIEW')),
-      count(listings, eq(listings.status, 'PENDING_REVIEW')),
-      count(eventRequests, eq(eventRequests.status, 'OPEN')),
-      count(vendors, eq(vendors.status, 'APPROVED')),
-      this.db.select({ status: orders.status, n: sql<number>`count(*)::int` }).from(orders).groupBy(orders.status),
+        .selectFrom(table as 'vendors')
+        .select((eb) => eb.fn.countAll<number>().as('n'))
+        .where('status', '=', status as Vendor['status'])
+        .executeTakeFirst()
+        .then(count);
+    const booked = sql.join(['CONFIRMED', 'IN_PROGRESS', 'COMPLETED']);
+    const [vendorsPending, listingsPending, openRequests, vendorsApproved, ordersByStatus, money, upcoming, unquoted] = await Promise.all([
+      countAll('vendors', 'PENDING_REVIEW'),
+      countAll('listings', 'PENDING_REVIEW'),
+      countAll('eventRequests', 'OPEN'),
+      countAll('vendors', 'APPROVED'),
       this.db
-        .select({
-          bookedPaise: sql<number>`coalesce(sum(${orders.totalPaise}) filter (where ${orders.status} in ('CONFIRMED','IN_PROGRESS','COMPLETED') and not ${orders.isDemo}), 0)::bigint`,
-          commissionPaise: sql<number>`coalesce(sum(${orders.commissionPaise}) filter (where ${orders.status} in ('CONFIRMED','IN_PROGRESS','COMPLETED') and not ${orders.isDemo}), 0)::bigint`,
-          collectedPaise: sql<number>`coalesce(sum(${orders.paidPaise}) filter (where not ${orders.isDemo}), 0)::bigint`,
-        })
-        .from(orders),
+        .selectFrom('orders')
+        .select(['status', (eb) => eb.fn.countAll<number>().as('n')])
+        .groupBy('status')
+        .execute(),
+      // Demo orders are excluded from money totals. BIGINT sums are returned as strings by the driver.
       this.db
-        .select({ n: sql<number>`count(*)::int` })
-        .from(orders)
-        .where(and(inArray(orders.status, ACTIVE_ORDER_STATUSES), gte(orders.eventDate, today), sql`${orders.eventDate} <= ${addDays(today, 7)}`)),
-      this.db.select({ n: sql<number>`count(*)::int` }).from(eventRequests).where(
-        and(
-          eq(eventRequests.status, 'OPEN'),
-          sql`not exists (select 1 from ${quotes} q where q.event_request_id = ${eventRequests.id} and q.status in ('QUOTED','REVISED'))`,
-          sql`${eventRequests.createdAt} < now() - interval '24 hours'`,
-        ),
-      ),
+        .selectFrom('orders')
+        .select([
+          sql<string>`SUM(CAST(CASE WHEN status IN (${booked}) AND is_demo = 0 THEN total_paise ELSE 0 END AS BIGINT))`.as('bookedPaise'),
+          sql<string>`SUM(CAST(CASE WHEN status IN (${booked}) AND is_demo = 0 THEN commission_paise ELSE 0 END AS BIGINT))`.as('commissionPaise'),
+          sql<string>`SUM(CAST(CASE WHEN is_demo = 0 THEN paid_paise ELSE 0 END AS BIGINT))`.as('collectedPaise'),
+        ])
+        .executeTakeFirstOrThrow(),
+      this.db
+        .selectFrom('orders')
+        .select((eb) => eb.fn.countAll<number>().as('n'))
+        .where('status', 'in', ACTIVE_ORDER_STATUSES)
+        .where('eventDate', '>=', today)
+        .where('eventDate', '<=', addDays(today, 7))
+        .executeTakeFirst()
+        .then(count),
+      this.db
+        .selectFrom('eventRequests as e')
+        .select((eb) => eb.fn.countAll<number>().as('n'))
+        .where('e.status', '=', 'OPEN')
+        .where((eb) =>
+          eb.not(
+            eb.exists(
+              eb.selectFrom('quotes as q').select(sql`1`.as('one')).whereRef('q.eventRequestId', '=', 'e.id').where('q.status', 'in', ['QUOTED', 'REVISED']),
+            ),
+          ),
+        )
+        .where(sql<boolean>`e.created_at < DATEADD(HOUR, -24, SYSUTCDATETIME())`)
+        .executeTakeFirst()
+        .then(count),
     ]);
     return {
       vendorsPending,
       vendorsApproved,
       listingsPending,
       openRequests,
-      requestsWithoutQuotes24h: unquoted.n,
-      upcomingEvents7d: upcoming.n,
+      requestsWithoutQuotes24h: unquoted,
+      upcomingEvents7d: upcoming,
       ordersByStatus: Object.fromEntries(ordersByStatus.map((r) => [r.status, r.n])),
-      bookedPaise: Number(money.bookedPaise),
-      commissionPaise: Number(money.commissionPaise),
-      collectedPaise: Number(money.collectedPaise),
+      bookedPaise: Number(money.bookedPaise ?? 0),
+      commissionPaise: Number(money.commissionPaise ?? 0),
+      collectedPaise: Number(money.collectedPaise ?? 0),
       note: 'Money totals exclude demo orders.',
     };
   }
@@ -83,53 +90,62 @@ export class AdminService {
   // ───────────── Vendors ─────────────
 
   async vendors(status: string | undefined, page: number, pageSize: number) {
-    const where = status ? eq(vendors.status, status as 'APPROVED') : undefined;
-    const rows = await this.db
-      .select({
-        id: vendors.id,
-        businessName: vendors.businessName,
-        slug: vendors.slug,
-        status: vendors.status,
-        city: vendors.city,
-        phone: vendors.phone,
-        isDemo: vendors.isDemo,
-        submittedAt: vendors.submittedAt,
-        createdAt: vendors.createdAt,
-      })
-      .from(vendors)
-      .where(where)
-      .orderBy(sql`${vendors.submittedAt} DESC NULLS LAST`, desc(vendors.createdAt))
-      .limit(pageSize)
-      .offset((page - 1) * pageSize);
-    const [{ total }] = await this.db.select({ total: sql<number>`count(*)::int` }).from(vendors).where(where);
-    return new Page(rows, page, pageSize, total);
+    let base = this.db.selectFrom('vendors');
+    if (status) base = base.where('status', '=', status as Vendor['status']);
+    const [rows, total] = await Promise.all([
+      base
+        .select(['id', 'businessName', 'slug', 'status', 'city', 'phone', 'isDemo', 'submittedAt', 'createdAt'])
+        .orderBy(sql`CASE WHEN submitted_at IS NULL THEN 1 ELSE 0 END`)
+        .orderBy('submittedAt', 'desc')
+        .orderBy('createdAt', 'desc')
+        .offset((page - 1) * pageSize)
+        .fetch(pageSize)
+        .execute(),
+      base.select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow(),
+    ]);
+    return new Page(rows, page, pageSize, total.n);
   }
 
   async vendor(id: string) {
-    const v = await this.db.query.vendors.findFirst({
-      where: eq(vendors.id, id),
-      with: {
-        categories: { with: { category: true } },
-        serviceAreas: { with: { serviceArea: true } },
-        members: { with: { user: { columns: { id: true, name: true, email: true, phone: true } } } },
-        reviews: { with: { reviewer: { columns: { name: true } } }, orderBy: [desc(vendorVerificationReviews.createdAt)] },
-        listings: { columns: { id: true, title: true, status: true, type: true } },
-      },
-    });
+    const v = await this.db.selectFrom('vendors').selectAll().where('id', '=', id).executeTakeFirst();
     if (!v) throw notFound('Vendor');
-    return {
-      ...v,
-      categories: v.categories.map((c) => c.category),
-      serviceAreas: v.serviceAreas.map((a) => a.serviceArea),
-      members: v.members.map((m) => ({ role: m.role, ...m.user })),
-      reviews: v.reviews.map((r) => ({ id: r.id, decision: r.decision, fromStatus: r.fromStatus, toStatus: r.toStatus, notes: r.notes, reviewer: r.reviewer.name, createdAt: r.createdAt })),
-      checklist: await vendorChecklist(this.db, v.id),
-    };
+    const [categories, serviceAreas, members, reviews, listings, checklist] = await Promise.all([
+      this.db
+        .selectFrom('vendorCategories')
+        .innerJoin('categories', 'categories.id', 'vendorCategories.categoryId')
+        .selectAll('categories')
+        .where('vendorCategories.vendorId', '=', id)
+        .orderBy('categories.sortOrder')
+        .execute(),
+      this.db
+        .selectFrom('vendorServiceAreas')
+        .innerJoin('serviceAreas', 'serviceAreas.id', 'vendorServiceAreas.serviceAreaId')
+        .selectAll('serviceAreas')
+        .where('vendorServiceAreas.vendorId', '=', id)
+        .orderBy('serviceAreas.name')
+        .execute(),
+      this.db
+        .selectFrom('vendorMembers')
+        .innerJoin('users', 'users.id', 'vendorMembers.userId')
+        .select(['vendorMembers.role', 'users.id', 'users.name', 'users.email', 'users.phone'])
+        .where('vendorMembers.vendorId', '=', id)
+        .execute(),
+      this.db
+        .selectFrom('vendorVerificationReviews as r')
+        .innerJoin('users', 'users.id', 'r.reviewerId')
+        .select(['r.id', 'r.decision', 'r.fromStatus', 'r.toStatus', 'r.notes', 'users.name as reviewer', 'r.createdAt'])
+        .where('r.vendorId', '=', id)
+        .orderBy('r.createdAt', 'desc')
+        .execute(),
+      this.db.selectFrom('listings').select(['id', 'title', 'status', 'type']).where('vendorId', '=', id).execute(),
+      vendorChecklist(this.db, id),
+    ]);
+    return { ...v, categories, serviceAreas, members, reviews, listings, checklist };
   }
 
   async decideVendor(actor: Actor, id: string, input: ModerationDecisionInput) {
-    await this.db.transaction(async (tx) => {
-      const [v] = await tx.select().from(vendors).where(eq(vendors.id, id)).for('update');
+    await this.db.transaction().execute(async (tx) => {
+      const v = await lockRow(tx, 'vendors', id);
       if (!v) throw notFound('Vendor');
       const t = canTransition(VENDOR_TRANSITIONS, input.decision, v.status, 'ADMIN');
       if (!t.ok) throw conflict('INVALID_TRANSITION', t.reason);
@@ -139,10 +155,14 @@ export class AdminService {
         if (missing.length) throw unprocessable('ONBOARDING_INCOMPLETE', 'This vendor has not completed onboarding.', missing);
       }
       await tx
-        .update(vendors)
-        .set({ status: t.to, approvedAt: t.to === 'APPROVED' ? new Date() : v.approvedAt })
-        .where(eq(vendors.id, id));
-      await tx.insert(vendorVerificationReviews).values({ vendorId: id, reviewerId: actor.userId, decision: input.decision, fromStatus: v.status, toStatus: t.to, notes: input.notes });
+        .updateTable('vendors')
+        .set({ status: t.to, approvedAt: t.to === 'APPROVED' ? now() : v.approvedAt, updatedAt: now() })
+        .where('id', '=', id)
+        .execute();
+      await tx
+        .insertInto('vendorVerificationReviews')
+        .values({ vendorId: id, reviewerId: actor.userId, decision: input.decision, fromStatus: v.status, toStatus: t.to, notes: input.notes })
+        .execute();
       await this.audit.record(actor, { action: `vendor.${input.decision}`, entityType: 'vendor', entityId: id, metadata: { from: v.status, to: t.to, notes: input.notes } }, tx);
     });
     return this.vendor(id);
@@ -151,62 +171,82 @@ export class AdminService {
   // ───────────── Listings ─────────────
 
   async listings(status: string | undefined, page: number, pageSize: number) {
-    const where = status ? eq(listings.status, status as 'APPROVED') : undefined;
-    const rows = await this.db
-      .select({
-        id: listings.id,
-        title: listings.title,
-        description: listings.description,
-        type: listings.type,
-        pricingMode: listings.pricingMode,
-        pricePaise: listings.pricePaise,
-        minGuests: listings.minGuests,
-        maxGuests: listings.maxGuests,
-        foodPreference: listings.foodPreference,
-        inclusions: listings.inclusions,
-        status: listings.status,
-        isDemo: listings.isDemo,
-        submittedAt: listings.submittedAt,
-        updatedAt: listings.updatedAt,
-        vendor: { id: vendors.id, businessName: vendors.businessName, status: vendors.status },
-        category: { id: categories.id, name: categories.name },
-      })
-      .from(listings)
-      .innerJoin(vendors, eq(vendors.id, listings.vendorId))
-      .innerJoin(categories, eq(categories.id, listings.categoryId))
-      .where(where)
-      .orderBy(sql`${listings.submittedAt} ASC NULLS LAST`, desc(listings.updatedAt))
-      .limit(pageSize)
-      .offset((page - 1) * pageSize);
-    const [{ total }] = await this.db.select({ total: sql<number>`count(*)::int` }).from(listings).where(where);
-    return new Page(rows, page, pageSize, total);
+    let base = this.db
+      .selectFrom('listings')
+      .innerJoin('vendors', 'vendors.id', 'listings.vendorId')
+      .innerJoin('categories', 'categories.id', 'listings.categoryId');
+    if (status) base = base.where('listings.status', '=', status as Listing['status']);
+    const [rows, total] = await Promise.all([
+      base
+        .select([
+          'listings.id',
+          'listings.title',
+          'listings.description',
+          'listings.type',
+          'listings.pricingMode',
+          'listings.pricePaise',
+          'listings.minGuests',
+          'listings.maxGuests',
+          'listings.foodPreference',
+          'listings.inclusions',
+          'listings.status',
+          'listings.isDemo',
+          'listings.submittedAt',
+          'listings.updatedAt',
+          'vendors.id as vendorId',
+          'vendors.businessName as vendorName',
+          'vendors.status as vendorStatus',
+          'categories.id as categoryId',
+          'categories.name as categoryName',
+        ])
+        .orderBy(sql`CASE WHEN listings.submitted_at IS NULL THEN 1 ELSE 0 END`)
+        .orderBy('listings.submittedAt')
+        .orderBy('listings.updatedAt', 'desc')
+        .offset((page - 1) * pageSize)
+        .fetch(pageSize)
+        .execute(),
+      base.select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow(),
+    ]);
+    return new Page(
+      rows.map(({ vendorId, vendorName, vendorStatus, categoryId, categoryName, ...l }) => ({
+        ...l,
+        vendor: { id: vendorId, businessName: vendorName, status: vendorStatus },
+        category: { id: categoryId, name: categoryName },
+      })),
+      page,
+      pageSize,
+      total.n,
+    );
   }
 
   async decideListing(actor: Actor, id: string, input: ModerationDecisionInput) {
-    await this.db.transaction(async (tx) => {
-      const [l] = await tx.select().from(listings).where(eq(listings.id, id)).for('update');
+    await this.db.transaction().execute(async (tx) => {
+      const l = await lockRow(tx, 'listings', id);
       if (!l) throw notFound('Listing');
       const t = canTransition(LISTING_TRANSITIONS, input.decision, l.status, 'ADMIN');
       if (!t.ok) throw conflict('INVALID_TRANSITION', t.reason);
       if (input.decision !== 'approve' && !input.notes) throw unprocessable('NOTES_REQUIRED', 'Explain the decision so the vendor knows what to fix.');
       await tx
-        .update(listings)
-        .set({ status: t.to, approvedAt: t.to === 'APPROVED' ? new Date() : l.approvedAt })
-        .where(eq(listings.id, id));
-      await tx.insert(moderationActions).values({ listingId: id, moderatorId: actor.userId, decision: input.decision, fromStatus: l.status, toStatus: t.to, notes: input.notes });
+        .updateTable('listings')
+        .set({ status: t.to, approvedAt: t.to === 'APPROVED' ? now() : l.approvedAt, updatedAt: now() })
+        .where('id', '=', id)
+        .execute();
+      await tx
+        .insertInto('moderationActions')
+        .values({ listingId: id, moderatorId: actor.userId, decision: input.decision, fromStatus: l.status, toStatus: t.to, notes: input.notes })
+        .execute();
       await this.audit.record(actor, { action: `listing.${input.decision}`, entityType: 'listing', entityId: id, metadata: { from: l.status, to: t.to, notes: input.notes } }, tx);
     });
-    const [row] = await this.db.select().from(listings).where(eq(listings.id, id));
-    return row;
+    return this.db.selectFrom('listings').selectAll().where('id', '=', id).executeTakeFirstOrThrow();
   }
 
   // ───────────── Commission ─────────────
 
   async commission() {
-    const rules = await this.db
-      .select({ id: commissionRules.id, vendorId: commissionRules.vendorId, categoryId: commissionRules.categoryId, bps: commissionRules.bps, updatedAt: commissionRules.updatedAt })
-      .from(commissionRules);
-    const cats = await this.db.select({ id: categories.id, name: categories.name, slug: categories.slug }).from(categories).orderBy(asc(categories.sortOrder));
+    const [rules, cats] = await Promise.all([
+      this.db.selectFrom('commissionRules').select(['id', 'vendorId', 'categoryId', 'bps', 'updatedAt']).execute(),
+      this.db.selectFrom('categories').select(['id', 'name', 'slug']).orderBy('sortOrder').execute(),
+    ]);
     const def = rules.find((r) => !r.vendorId && !r.categoryId);
     return {
       defaultBps: def?.bps ?? 1000,
@@ -218,20 +258,30 @@ export class AdminService {
 
   async updateCommission(actor: Actor, input: CommissionSettingsInput) {
     const before = await this.commission();
-    await this.db.transaction(async (tx) => {
-      const def = await tx.select().from(commissionRules).where(and(isNull(commissionRules.vendorId), isNull(commissionRules.categoryId))).for('update');
-      if (def[0]) await tx.update(commissionRules).set({ bps: input.defaultBps }).where(eq(commissionRules.id, def[0].id));
-      else await tx.insert(commissionRules).values({ bps: input.defaultBps });
-      await tx.delete(commissionRules).where(and(isNull(commissionRules.vendorId), sql`${commissionRules.categoryId} is not null`));
+    await this.db.transaction().execute(async (tx) => {
+      const def = await sql<{ id: string }>`
+        SELECT id FROM commission_rules WITH (UPDLOCK, ROWLOCK) WHERE vendor_id IS NULL AND category_id IS NULL`.execute(tx);
+      if (def.rows[0]) await tx.updateTable('commissionRules').set({ bps: input.defaultBps, updatedAt: now() }).where('id', '=', def.rows[0].id).execute();
+      else await tx.insertInto('commissionRules').values({ bps: input.defaultBps, vendorId: null, categoryId: null }).execute();
+      await tx.deleteFrom('commissionRules').where('vendorId', 'is', null).where('categoryId', 'is not', null).execute();
       if (input.categoryOverrides.length) {
         const ids = [...new Set(input.categoryOverrides.map((o) => o.categoryId))];
-        const valid = await tx.select({ id: categories.id }).from(categories).where(inArray(categories.id, ids));
+        if (ids.length !== input.categoryOverrides.length) throw unprocessable('DUPLICATE_CATEGORY', 'Each category can have only one override.');
+        const valid = await tx.selectFrom('categories').select('id').where('id', 'in', ids).execute();
         if (valid.length !== ids.length) throw unprocessable('INVALID_CATEGORY', 'Unknown category in overrides.');
-        await tx.insert(commissionRules).values(input.categoryOverrides.map((o) => ({ categoryId: o.categoryId, bps: o.bps })));
+        await tx
+          .insertInto('commissionRules')
+          .values(input.categoryOverrides.map((o) => ({ categoryId: o.categoryId, vendorId: null, bps: o.bps })))
+          .execute();
       }
       await this.audit.record(
         actor,
-        { action: 'settings.commission_updated', entityType: 'settings', entityId: 'commission', metadata: { before: { defaultBps: before.defaultBps, categories: before.categories.filter((c) => c.bps != null) }, after: input } },
+        {
+          action: 'settings.commission_updated',
+          entityType: 'settings',
+          entityId: 'commission',
+          metadata: { before: { defaultBps: before.defaultBps, categories: before.categories.filter((c) => c.bps != null) }, after: input },
+        },
         tx,
       );
     });
@@ -241,34 +291,31 @@ export class AdminService {
   // ───────────── Audit ─────────────
 
   async auditLogs(q: { entityType?: string; entityId?: string; page: number; pageSize: number }) {
-    const conds: SQL[] = [];
-    if (q.entityType) conds.push(eq(auditLogs.entityType, q.entityType));
-    if (q.entityId) conds.push(eq(auditLogs.entityId, q.entityId));
-    const where = conds.length ? and(...conds) : undefined;
-    const rows = await this.db
-      .select({
-        id: auditLogs.id,
-        action: auditLogs.action,
-        entityType: auditLogs.entityType,
-        entityId: auditLogs.entityId,
-        metadata: auditLogs.metadata,
-        actorRole: auditLogs.actorRole,
-        actorName: users.name,
-        ip: auditLogs.ip,
-        createdAt: auditLogs.createdAt,
-      })
-      .from(auditLogs)
-      .leftJoin(users, eq(users.id, auditLogs.actorId))
-      .where(where)
-      .orderBy(desc(auditLogs.createdAt))
-      .limit(q.pageSize)
-      .offset((q.page - 1) * q.pageSize);
-    const [{ total }] = await this.db.select({ total: sql<number>`count(*)::int` }).from(auditLogs).where(where);
-    return new Page(rows, q.page, q.pageSize, total);
-  }
-
-  async vendorUsers(vendorId: string) {
-    return this.db.select({ userId: vendorMembers.userId }).from(vendorMembers).where(eq(vendorMembers.vendorId, vendorId));
+    let base = this.db.selectFrom('auditLogs');
+    if (q.entityType) base = base.where('auditLogs.entityType', '=', q.entityType);
+    if (q.entityId) base = base.where('auditLogs.entityId', '=', q.entityId);
+    const [rows, total] = await Promise.all([
+      base
+        .leftJoin('users', 'users.id', 'auditLogs.actorId')
+        .select([
+          'auditLogs.id',
+          'auditLogs.action',
+          'auditLogs.entityType',
+          'auditLogs.entityId',
+          'auditLogs.metadata',
+          'auditLogs.actorRole',
+          'users.name as actorName',
+          'auditLogs.ip',
+          'auditLogs.createdAt',
+        ])
+        .orderBy('auditLogs.createdAt', 'desc')
+        .orderBy('auditLogs.id', 'desc')
+        .offset((q.page - 1) * q.pageSize)
+        .fetch(q.pageSize)
+        .execute(),
+      base.select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow(),
+    ]);
+    return new Page(rows, q.page, q.pageSize, total.n);
   }
 }
 

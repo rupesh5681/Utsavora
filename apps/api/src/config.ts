@@ -8,6 +8,7 @@ export interface AppConfig {
   authRateLimitPerMinute: number;
   writeRateLimitPerMinute: number;
   outboxIntervalMs: number;
+  dbPoolMax: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -25,9 +26,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     authRateLimitPerMinute: Number(env.AUTH_RATE_LIMIT_PER_MINUTE ?? 10),
     writeRateLimitPerMinute: Number(env.WRITE_RATE_LIMIT_PER_MINUTE ?? 30),
     outboxIntervalMs: Number(env.OUTBOX_INTERVAL_MS ?? 3000),
+    dbPoolMax: Number(env.DB_POOL_MAX ?? 10),
   };
 }
 
 export const CONFIG = Symbol('CONFIG');
 export const DB = Symbol('DB');
-export const PG_POOL = Symbol('PG_POOL');

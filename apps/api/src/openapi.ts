@@ -6,7 +6,7 @@ import { createApp, buildOpenApi } from './app.factory';
 import { loadConfig } from './config';
 
 async function main() {
-  const app = await createApp({ ...loadConfig({ ...process.env, DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://unused/unused' }), outboxIntervalMs: 0 }, { logger: false });
+  const app = await createApp({ ...loadConfig({ ...process.env, DATABASE_URL: process.env.DATABASE_URL ?? 'Server=localhost;Database=unused;User Id=unused;Password=unused' }), outboxIntervalMs: 0 }, { logger: false });
   await app.init();
   const out = path.resolve(__dirname, '../../../docs/openapi.json');
   writeFileSync(out, JSON.stringify(buildOpenApi(app), null, 2));

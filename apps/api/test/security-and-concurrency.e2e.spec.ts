@@ -1,6 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
-import { eq } from 'drizzle-orm';
 import { hash } from '@node-rs/argon2';
 import {
   admin,
@@ -17,7 +16,6 @@ import {
   type Ref,
 } from './helpers';
 import type { Db } from '../src/db/client';
-import { userAdminPermissions, userRoles, users } from '../src/db/schema';
 import { toCsv } from '../src/admin/admin.service';
 
 let app: INestApplication;
@@ -118,9 +116,13 @@ describe('authorization and data isolation', () => {
 
   it('enforces explicit admin permissions', async () => {
     const email = `limited-${Date.now()}@test.local`;
-    const [u] = await db.insert(users).values({ email, name: 'Support Agent', phone: '9999900000', passwordHash: await hash(PASSWORD) }).returning();
-    await db.insert(userRoles).values({ userId: u.id, role: 'ADMIN' });
-    await db.insert(userAdminPermissions).values({ userId: u.id, permission: 'VENDORS_REVIEW' });
+    const u = await db
+      .insertInto('users')
+      .output('inserted.id')
+      .values({ email, name: 'Support Agent', phone: '9999900000', passwordHash: await hash(PASSWORD) })
+      .executeTakeFirstOrThrow();
+    await db.insertInto('userRoles').values({ userId: u.id, role: 'ADMIN' }).execute();
+    await db.insertInto('userAdminPermissions').values({ userId: u.id, permission: 'VENDORS_REVIEW' }).execute();
     const s = new Session(app, 'admin');
     await s.post('/auth/login', { email, password: PASSWORD }).expect(200);
     expect((await s.get('/admin/vendors')).status).toBe(200);
@@ -129,7 +131,7 @@ describe('authorization and data isolation', () => {
     expect(denied.body.error.message).toContain('ORDERS_MANAGE');
     expect((await s.put('/admin/settings/commission', { defaultBps: 0 })).status).toBe(403);
     expect((await s.get('/admin/orders/export.csv')).status).toBe(403);
-    await db.delete(users).where(eq(users.id, u.id));
+    await db.updateTable('users').set({ isActive: false }).where('id', '=', u.id).execute();
   });
 
   it('blocks unapproved vendors from quoting and requires complete onboarding for approval', async () => {

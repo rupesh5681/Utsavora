@@ -1,12 +1,10 @@
 /**
- * First objective, end to end against a real PostgreSQL database:
+ * First objective, end to end against a real SQL Server database:
  * customer request → approved vendor quotes (and revises) → customer accepts → durable, tracked order.
  */
 import type { INestApplication } from '@nestjs/common';
-import { eq } from 'drizzle-orm';
 import { admin, bootApp, createRequest, futureDate, newCustomer, newVendor, refData, revisionBody, vendorQuoteFor, type Ref } from './helpers';
 import type { Db } from '../src/db/client';
-import { notifications, quoteRevisions, orders } from '../src/db/schema';
 import type { OutboxService } from '../src/common/outbox.service';
 
 let app: INestApplication;
@@ -87,7 +85,7 @@ describe('request → quote → accept → order', () => {
     expect(order.actions).toEqual(['customer_cancel']);
 
     // Commission: catering rule 8% of taxable 5,800,000 = 464,000.
-    const [row] = await db.select().from(orders).where(eq(orders.id, order.id));
+    const row = await db.selectFrom('orders').selectAll().where('id', '=', order.id).executeTakeFirstOrThrow();
     expect(row.commissionBps).toBe(800);
     expect(row.commissionPaise).toBe(464000);
     expect(row.vendorPayablePaise).toBe(6240000 - 464000);
@@ -157,7 +155,7 @@ describe('request → quote → accept → order', () => {
     expect(loserNotes.body.data.items.map((n: { type: string }) => n.type)).toContain('quote.not_selected');
     const customerNotes = await customer.get('/notifications');
     expect(customerNotes.body.data.unread).toBeGreaterThanOrEqual(3);
-    const n = await db.select().from(notifications).where(eq(notifications.type, 'quote.submitted'));
+    const n = await db.selectFrom('notifications').selectAll().where('type', '=', 'quote.submitted').execute();
     expect(n.length).toBeGreaterThanOrEqual(3);
 
     // Admin booking queue + CSV export.
@@ -204,7 +202,7 @@ describe('request → quote → accept → order', () => {
     const req = (await createRequest(c, ref, { serviceAreaId: ref.areas[area] })).body.data.id;
     const q = await vendorQuoteFor(v, req);
     const rev = (await v.post(`/vendor/quotes/${q}/revisions`, revisionBody())).body.data.revisions[0];
-    await db.update(quoteRevisions).set({ totalPaise: 100, advancePaise: 30 }).where(eq(quoteRevisions.id, rev.id));
+    await db.updateTable('quoteRevisions').set({ totalPaise: 100, advancePaise: 30 }).where('id', '=', rev.id).execute();
     const r = await c.post(`/requests/${req}/quotes/${q}/accept`, { revisionId: rev.id });
     expect(r.status).toBe(409);
     expect(r.body.error.code).toBe('PRICE_MISMATCH');
@@ -217,7 +215,7 @@ describe('request → quote → accept → order', () => {
     const req = (await createRequest(c, ref, { serviceAreaId: ref.areas[area] })).body.data.id;
     const q = await vendorQuoteFor(v, req);
     const rev = (await v.post(`/vendor/quotes/${q}/revisions`, revisionBody({ validUntil: futureDate(1) }))).body.data.revisions[0];
-    await db.update(quoteRevisions).set({ validUntil: futureDate(-1) }).where(eq(quoteRevisions.id, rev.id));
+    await db.updateTable('quoteRevisions').set({ validUntil: futureDate(-1) }).where('id', '=', rev.id).execute();
     const r = await c.post(`/requests/${req}/quotes/${q}/accept`, { revisionId: rev.id });
     expect(r.status).toBe(409);
     expect(r.body.error.code).toBe('QUOTE_NOT_ACCEPTABLE');

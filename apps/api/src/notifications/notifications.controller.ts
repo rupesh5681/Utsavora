@@ -1,9 +1,7 @@
 import { Controller, Get, HttpCode, Inject, Param, ParseUUIDPipe, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
 import { DB } from '../config';
-import type { Db } from '../db/client';
-import { notifications } from '../db/schema';
+import { now, type Db } from '../db/client';
 import { CurrentActor, type Actor } from '../auth/actor';
 
 @ApiTags('notifications')
@@ -13,25 +11,36 @@ export class NotificationsController {
 
   @Get()
   async list(@CurrentActor() actor: Actor) {
-    const items = await this.db.select().from(notifications).where(eq(notifications.userId, actor.userId)).orderBy(desc(notifications.createdAt)).limit(50);
-    const [{ unread }] = await this.db
-      .select({ unread: sql<number>`count(*)::int` })
-      .from(notifications)
-      .where(and(eq(notifications.userId, actor.userId), isNull(notifications.readAt)));
+    const [items, { unread }] = await Promise.all([
+      this.db
+        .selectFrom('notifications')
+        .selectAll()
+        .where('userId', '=', actor.userId)
+        .orderBy('createdAt', 'desc')
+        .orderBy('id', 'desc')
+        .top(50)
+        .execute(),
+      this.db
+        .selectFrom('notifications')
+        .select((eb) => eb.fn.countAll<number>().as('unread'))
+        .where('userId', '=', actor.userId)
+        .where('readAt', 'is', null)
+        .executeTakeFirstOrThrow(),
+    ]);
     return { items, unread };
   }
 
   @HttpCode(200)
   @Post(':id/read')
   async read(@CurrentActor() actor: Actor, @Param('id', ParseUUIDPipe) id: string) {
-    await this.db.update(notifications).set({ readAt: new Date() }).where(and(eq(notifications.id, id), eq(notifications.userId, actor.userId)));
+    await this.db.updateTable('notifications').set({ readAt: now() }).where('id', '=', id).where('userId', '=', actor.userId).execute();
     return { ok: true };
   }
 
   @HttpCode(200)
   @Post('read-all')
   async readAll(@CurrentActor() actor: Actor) {
-    await this.db.update(notifications).set({ readAt: new Date() }).where(and(eq(notifications.userId, actor.userId), isNull(notifications.readAt)));
+    await this.db.updateTable('notifications').set({ readAt: now() }).where('userId', '=', actor.userId).where('readAt', 'is', null).execute();
     return { ok: true };
   }
 }

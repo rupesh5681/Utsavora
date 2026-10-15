@@ -6,10 +6,8 @@
  *   SEED_DEMO_DATA=true                      add demo vendors + demo customer (never in production)
  */
 import { hash } from '@node-rs/argon2';
-import { and, eq, isNull, sql } from 'drizzle-orm';
-import { createDb, type Db } from './client';
-import * as s from './schema';
-import { ALL_ADMIN_PERMISSIONS } from '@utsavora/types';
+import { createDb, json, now, type Db } from './client';
+import { ALL_ADMIN_PERMISSIONS, type FoodPreference } from '@utsavora/types';
 
 export const OCCASIONS = [
   { slug: 'birthday', name: 'Birthdays', description: 'First birthdays to milestone 50ths — cakes, décor, food and fun.', sortOrder: 1 },
@@ -55,57 +53,68 @@ const slugify = (x: string) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '');
 
+
 export async function seedReferenceData(db: Db) {
   for (const o of OCCASIONS) {
-    await db.insert(s.occasions).values(o).onConflictDoUpdate({ target: s.occasions.slug, set: { name: o.name, description: o.description, sortOrder: o.sortOrder } });
+    const found = await db.selectFrom('occasions').select('id').where('slug', '=', o.slug).executeTakeFirst();
+    if (found) await db.updateTable('occasions').set({ name: o.name, description: o.description, sortOrder: o.sortOrder }).where('id', '=', found.id).execute();
+    else await db.insertInto('occasions').values(o).execute();
   }
   for (const c of CATEGORIES) {
-    await db.insert(s.categories).values(c).onConflictDoUpdate({
-      target: s.categories.slug,
-      set: { name: c.name, description: c.description, requiresFssai: c.requiresFssai, defaultTaxBps: c.defaultTaxBps, sortOrder: c.sortOrder },
-    });
+    const found = await db.selectFrom('categories').select('id').where('slug', '=', c.slug).executeTakeFirst();
+    const values = { name: c.name, description: c.description, requiresFssai: c.requiresFssai, defaultTaxBps: c.defaultTaxBps, sortOrder: c.sortOrder };
+    if (found) await db.updateTable('categories').set(values).where('id', '=', found.id).execute();
+    else await db.insertInto('categories').values({ slug: c.slug, ...values }).execute();
   }
   for (const name of GN_AREAS) {
-    await db
-      .insert(s.serviceAreas)
-      .values({ name, city: 'Greater Noida', slug: `greater-noida-${slugify(name)}` })
-      .onConflictDoNothing();
+    const slug = `greater-noida-${slugify(name)}`;
+    const found = await db.selectFrom('serviceAreas').select('id').where('slug', '=', slug).executeTakeFirst();
+    if (!found) await db.insertInto('serviceAreas').values({ name, city: 'Greater Noida', slug }).execute();
   }
-  const cats = await db.select().from(s.categories);
+  const cats = await db.selectFrom('categories').select(['id', 'slug']).execute();
   const bySlug = new Map(cats.map((c) => [c.slug, c.id]));
   for (const r of RATES) {
     const categoryId = bySlug.get(r.cat)!;
-    await db
-      .insert(s.budgetRates)
-      .values({ categoryId, unit: r.unit, lowPaise: r.low * 100, highPaise: r.high * 100, foodPreference: r.food ?? null })
-      .onConflictDoUpdate({
-        target: [s.budgetRates.categoryId, s.budgetRates.foodPreference],
-        set: { unit: r.unit, lowPaise: r.low * 100, highPaise: r.high * 100 },
-      });
+    const food = (r.food ?? null) as FoodPreference | null;
+    const existing = await db
+      .selectFrom('budgetRates')
+      .select('id')
+      .where('categoryId', '=', categoryId)
+      .where((eb) => (food === null ? eb('foodPreference', 'is', null) : eb('foodPreference', '=', food)))
+      .executeTakeFirst();
+    const values = { unit: r.unit, lowPaise: r.low * 100, highPaise: r.high * 100 };
+    if (existing) await db.updateTable('budgetRates').set({ ...values, updatedAt: now() }).where('id', '=', existing.id).execute();
+    else await db.insertInto('budgetRates').values({ categoryId, foodPreference: food, ...values }).execute();
   }
   // Default commission 10%, catering 8%. Only created if missing — admins own these afterwards.
-  const def = await db.select().from(s.commissionRules).where(and(isNull(s.commissionRules.vendorId), isNull(s.commissionRules.categoryId)));
-  if (def.length === 0) await db.insert(s.commissionRules).values({ bps: 1000 });
-  const cat = await db
-    .select()
-    .from(s.commissionRules)
-    .where(and(isNull(s.commissionRules.vendorId), eq(s.commissionRules.categoryId, bySlug.get('catering')!)));
-  if (cat.length === 0) await db.insert(s.commissionRules).values({ bps: 800, categoryId: bySlug.get('catering')! });
+  const def = await db.selectFrom('commissionRules').select('id').where('vendorId', 'is', null).where('categoryId', 'is', null).executeTakeFirst();
+  if (!def) await db.insertInto('commissionRules').values({ bps: 1000, vendorId: null, categoryId: null }).execute();
+  const catering = bySlug.get('catering')!;
+  const cat = await db.selectFrom('commissionRules').select('id').where('vendorId', 'is', null).where('categoryId', '=', catering).executeTakeFirst();
+  if (!cat) await db.insertInto('commissionRules').values({ bps: 800, vendorId: null, categoryId: catering }).execute();
 }
 
 async function upsertUser(db: Db, u: { email: string; name: string; phone: string; password: string; roles: ('CUSTOMER' | 'VENDOR' | 'ADMIN')[] }) {
-  const existing = await db.query.users.findFirst({ where: eq(s.users.email, u.email) });
+  const existing = await db.selectFrom('users').select('id').where('email', '=', u.email).executeTakeFirst();
   const id =
     existing?.id ??
-    (await db.insert(s.users).values({ email: u.email, name: u.name, phone: u.phone, passwordHash: await hash(u.password) }).returning())[0].id;
-  for (const role of u.roles) await db.insert(s.userRoles).values({ userId: id, role }).onConflictDoNothing();
+    (await db
+      .insertInto('users')
+      .output('inserted.id')
+      .values({ email: u.email, name: u.name, phone: u.phone, passwordHash: await hash(u.password) })
+      .executeTakeFirstOrThrow()).id;
+  for (const role of u.roles) {
+    const has = await db.selectFrom('userRoles').select('role').where('userId', '=', id).where('role', '=', role).executeTakeFirst();
+    if (!has) await db.insertInto('userRoles').values({ userId: id, role }).execute();
+  }
   return id;
 }
 
 export async function seedAdmin(db: Db, email: string, password: string) {
   const id = await upsertUser(db, { email, name: 'Utsavora Admin', phone: '9999999999', password, roles: ['ADMIN'] });
+  const have = new Set((await db.selectFrom('userAdminPermissions').select('permission').where('userId', '=', id).execute()).map((p) => p.permission));
   for (const permission of ALL_ADMIN_PERMISSIONS) {
-    await db.insert(s.userAdminPermissions).values({ userId: id, permission }).onConflictDoNothing();
+    if (!have.has(permission)) await db.insertInto('userAdminPermissions').values({ userId: id, permission }).execute();
   }
   return id;
 }
@@ -219,14 +228,15 @@ const DEMO_VENDORS: DemoVendor[] = [
   },
 ];
 
+
 export async function seedDemoData(db: Db, demoPassword: string) {
-  const cats = new Map((await db.select().from(s.categories)).map((c) => [c.slug, c.id]));
-  const areas = new Map((await db.select().from(s.serviceAreas)).map((a) => [a.name, a.id]));
-  const occ = new Map((await db.select().from(s.occasions)).map((o) => [o.slug, o.id]));
-  const now = new Date();
+  const cats = new Map((await db.selectFrom('categories').select(['id', 'slug']).execute()).map((c) => [c.slug, c.id]));
+  const areas = new Map((await db.selectFrom('serviceAreas').select(['id', 'name']).execute()).map((a) => [a.name, a.id]));
+  const occ = new Map((await db.selectFrom('occasions').select(['id', 'slug']).execute()).map((o) => [o.slug, o.id]));
+  const ts = new Date();
 
   for (const [i, v] of DEMO_VENDORS.entries()) {
-    const existing = await db.query.vendors.findFirst({ where: eq(s.vendors.slug, v.slug) });
+    const existing = await db.selectFrom('vendors').select('id').where('slug', '=', v.slug).executeTakeFirst();
     if (existing) continue;
     const userId = await upsertUser(db, {
       email: `vendor${i + 1}.demo@utsavora.local`,
@@ -235,47 +245,52 @@ export async function seedDemoData(db: Db, demoPassword: string) {
       password: demoPassword,
       roles: ['VENDOR'],
     });
-    const [vendor] = await db
-      .insert(s.vendors)
-      .values({
-        slug: v.slug,
-        businessName: v.businessName,
-        description: v.description,
-        phone: `98100000${10 + i}`,
-        fssaiNumber: v.fssai ?? null,
-        maxEventsPerDay: 3,
-        status: 'APPROVED',
-        isDemo: true,
-        submittedAt: now,
-        approvedAt: now,
-      })
-      .returning();
-    await db.insert(s.vendorMembers).values({ vendorId: vendor.id, userId, role: 'OWNER' });
-    await db.insert(s.vendorCategories).values(v.categories.map((c) => ({ vendorId: vendor.id, categoryId: cats.get(c)! })));
-    await db.insert(s.vendorServiceAreas).values(v.areas.map((a) => ({ vendorId: vendor.id, serviceAreaId: areas.get(a)! })));
-    for (const l of v.listings) {
-      const [listing] = await db
-        .insert(s.listings)
+    await db.transaction().execute(async (trx) => {
+      const vendor = await trx
+        .insertInto('vendors')
+        .output('inserted.id')
         .values({
-          vendorId: vendor.id,
-          categoryId: cats.get(l.cat)!,
-          title: l.title,
-          description: l.description,
-          type: l.type,
-          pricingMode: l.pricingMode,
-          pricePaise: l.price != null ? l.price * 100 : null,
-          minGuests: l.minGuests ?? null,
-          maxGuests: l.maxGuests ?? null,
-          foodPreference: l.food ?? 'NOT_APPLICABLE',
-          inclusions: l.inclusions,
+          slug: v.slug,
+          businessName: v.businessName,
+          description: v.description,
+          phone: `98100000${10 + i}`,
+          fssaiNumber: v.fssai ?? null,
+          gstin: null,
+          maxEventsPerDay: 3,
           status: 'APPROVED',
           isDemo: true,
-          submittedAt: now,
-          approvedAt: now,
+          submittedAt: ts,
+          approvedAt: ts,
         })
-        .returning();
-      await db.insert(s.listingOccasions).values(l.occasions.map((o) => ({ listingId: listing.id, occasionId: occ.get(o)! })));
-    }
+        .executeTakeFirstOrThrow();
+      await trx.insertInto('vendorMembers').values({ vendorId: vendor.id, userId, role: 'OWNER' }).execute();
+      await trx.insertInto('vendorCategories').values(v.categories.map((c) => ({ vendorId: vendor.id, categoryId: cats.get(c)! }))).execute();
+      await trx.insertInto('vendorServiceAreas').values(v.areas.map((a) => ({ vendorId: vendor.id, serviceAreaId: areas.get(a)! }))).execute();
+      for (const l of v.listings) {
+        const listing = await trx
+          .insertInto('listings')
+          .output('inserted.id')
+          .values({
+            vendorId: vendor.id,
+            categoryId: cats.get(l.cat)!,
+            title: l.title,
+            description: l.description,
+            type: l.type,
+            pricingMode: l.pricingMode,
+            pricePaise: l.price != null ? l.price * 100 : null,
+            minGuests: l.minGuests ?? null,
+            maxGuests: l.maxGuests ?? null,
+            foodPreference: l.food ?? 'NOT_APPLICABLE',
+            inclusions: json(l.inclusions),
+            status: 'APPROVED',
+            isDemo: true,
+            submittedAt: ts,
+            approvedAt: ts,
+          })
+          .executeTakeFirstOrThrow();
+        await trx.insertInto('listingOccasions').values(l.occasions.map((o) => ({ listingId: listing.id, occasionId: occ.get(o)! }))).execute();
+      }
+    });
   }
   await upsertUser(db, { email: 'customer.demo@utsavora.local', name: 'Demo Customer', phone: '9810000099', password: demoPassword, roles: ['CUSTOMER'] });
 }
@@ -283,7 +298,7 @@ export async function seedDemoData(db: Db, demoPassword: string) {
 async function main() {
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error('DATABASE_URL is not set');
-  const { db, pool } = createDb(url, 2);
+  const db = createDb(url, 2);
   try {
     await seedReferenceData(db);
     const adminEmail = process.env.SEED_ADMIN_EMAIL;
@@ -299,10 +314,10 @@ async function main() {
       await seedDemoData(db, process.env.SEED_DEMO_PASSWORD ?? 'Utsav-Demo-2026');
       console.log('Demo vendors, listings and accounts seeded (all marked as demo).');
     }
-    const [{ count }] = await db.select({ count: sql<number>`count(*)::int` }).from(s.listings);
+    const { count } = await db.selectFrom('listings').select((eb) => eb.fn.countAll<number>().as('count')).executeTakeFirstOrThrow();
     console.log(`Seed complete. Listings in database: ${count}`);
   } finally {
-    await pool.end();
+    await db.destroy();
   }
 }
 

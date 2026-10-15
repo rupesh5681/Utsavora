@@ -3,7 +3,7 @@ import { z } from 'zod';
 const trimmed = (max: number) => z.string().trim().min(1, 'Required').max(max);
 const optionalText = (max: number) => z.string().trim().max(max).optional().default('');
 const id = z.string().min(1).max(64);
-const paise = z.number().int("Must be a whole number of paise").min(0).max(2_000_000_000, "Amount cannot exceed ₹2 crore"); // fits a Postgres INT column
+const paise = z.number().int("Must be a whole number of paise").min(0).max(2_000_000_000, "Amount cannot exceed ₹2 crore"); // fits a SQL Server INT column
 const bps = (max: number) => z.number().int().min(0).max(max);
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD');
 
