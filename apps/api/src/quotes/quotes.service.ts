@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nest
 import { computeQuoteTotals, QUOTE_ACCEPTABLE, QUOTE_REVISABLE, QUOTE_TERMINAL, type QuoteStatus } from '@utsavora/types';
 import type { AcceptQuoteInput, EventRequestInput, QuoteRevisionInput, ReasonInput } from '@utsavora/validation';
 import { CONFIG, DB, type AppConfig } from '../config';
-import { json, lockRow, now, shareLockRow, sql, type Db, type DbOrTx, type Tx } from '../db/client';
+import { appLock, json, lockRow, now, shareLockRow, sql, vendorDayLockKey, withDeadlockRetry, type Db, type DbOrTx, type Tx } from '../db/client';
 import type { EventRequest, QuoteItem, QuoteRevision } from '../db/types';
 import { conflict, forbidden, notFound, unprocessable } from '../common/errors';
 import { AuditService } from '../common/audit.service';
@@ -75,20 +75,43 @@ export class QuotesService implements OnModuleInit, OnModuleDestroy {
    */
   async expireStale(db: DbOrTx = this.db) {
     const today = todayIST();
-    await sql`
-      UPDATE q SET q.status = 'EXPIRED', q.updated_at = SYSUTCDATETIME()
-      FROM quotes q
-      JOIN quote_revisions r ON r.id = q.current_revision_id
-      WHERE q.status IN ('QUOTED', 'REVISED') AND r.valid_until < CAST(${today} AS DATE);
-
-      UPDATE q SET q.status = 'EXPIRED', q.updated_at = SYSUTCDATETIME()
-      FROM quotes q
-      JOIN event_requests e ON e.id = q.event_request_id
-      WHERE e.status = 'OPEN' AND e.event_date < CAST(${today} AS DATE)
-        AND q.status NOT IN (${sql.join(QUOTE_TERMINAL)});
-
-      UPDATE event_requests SET status = 'EXPIRED', updated_at = SYSUTCDATETIME()
-      WHERE status = 'OPEN' AND event_date < CAST(${today} AS DATE);`.execute(db);
+    // Plain reads first (row versions under READ_COMMITTED_SNAPSHOT: no locks, no waiting).
+    const [lapsedQuotes, pastQuotes, pastRequests] = await Promise.all([
+      db
+        .selectFrom('quotes')
+        .innerJoin('quoteRevisions', 'quoteRevisions.id', 'quotes.currentRevisionId')
+        .select('quotes.id')
+        .where('quotes.status', 'in', ['QUOTED', 'REVISED'])
+        .where('quoteRevisions.validUntil', '<', today)
+        .execute(),
+      db
+        .selectFrom('quotes')
+        .innerJoin('eventRequests', 'eventRequests.id', 'quotes.eventRequestId')
+        .select('quotes.id')
+        .where('eventRequests.status', '=', 'OPEN')
+        .where('eventRequests.eventDate', '<', today)
+        .where('quotes.status', 'not in', QUOTE_TERMINAL)
+        .execute(),
+      db.selectFrom('eventRequests').select('id').where('status', '=', 'OPEN').where('eventDate', '<', today).execute(),
+    ]);
+    // Then update by primary key, re-checking the status so a concurrent change always wins.
+    const quoteIds = [...new Set([...lapsedQuotes, ...pastQuotes].map((q) => q.id))];
+    if (quoteIds.length) {
+      await db
+        .updateTable('quotes')
+        .set({ status: 'EXPIRED', updatedAt: now() })
+        .where('id', 'in', quoteIds)
+        .where('status', 'not in', QUOTE_TERMINAL)
+        .execute();
+    }
+    if (pastRequests.length) {
+      await db
+        .updateTable('eventRequests')
+        .set({ status: 'EXPIRED', updatedAt: now() })
+        .where('id', 'in', pastRequests.map((r) => r.id))
+        .where('status', '=', 'OPEN')
+        .execute();
+    }
   }
 
   // ─────────────────────────── Customer: event requests ───────────────────────────
@@ -320,17 +343,25 @@ export class QuotesService implements OnModuleInit, OnModuleDestroy {
       if (!r || r.customerId !== actor.userId) throw notFound('Event request');
       if (r.status !== 'OPEN') throw conflict('INVALID_TRANSITION', `This request is ${r.status.toLowerCase()} and can no longer be cancelled.`);
       await tx.updateTable('eventRequests').set({ status: 'CANCELLED', updatedAt: now() }).where('id', '=', id).execute();
-      const affected = await tx
-        .updateTable('quotes')
-        .set({ status: 'NOT_SELECTED', updatedAt: now() })
-        .output(['inserted.id', 'inserted.vendorId'])
-        .where('eventRequestId', '=', id)
-        .where('status', 'not in', QUOTE_TERMINAL)
-        .execute();
-      for (const q of affected) await this.outbox.enqueue(tx, 'quote.not_selected', { quoteId: q.id, vendorId: q.vendorId, reference: r.reference });
+      await this.closeOtherQuotes(tx, id, null, r.reference);
       await this.audit.record(actor, { action: 'event_request.cancelled', entityType: 'event_request', entityId: id, metadata: { reason: input.reason } }, tx);
     });
     return this.requestDetail(actor, id);
+  }
+
+  /** Marks the request's other open quotes NOT_SELECTED (by primary key) and notifies those vendors. */
+  private async closeOtherQuotes(tx: Tx, requestId: string, keepQuoteId: string | null, reference: string) {
+    let q = tx.selectFrom('quotes').select(['id', 'vendorId']).where('eventRequestId', '=', requestId).where('status', 'not in', QUOTE_TERMINAL);
+    if (keepQuoteId) q = q.where('id', '!=', keepQuoteId);
+    const others = await q.execute();
+    if (others.length === 0) return;
+    await tx
+      .updateTable('quotes')
+      .set({ status: 'NOT_SELECTED', updatedAt: now() })
+      .where('id', 'in', others.map((o) => o.id))
+      .where('status', 'not in', QUOTE_TERMINAL)
+      .execute();
+    for (const o of others) await this.outbox.enqueue(tx, 'quote.not_selected', { quoteId: o.id, vendorId: o.vendorId, reference });
   }
 
   private async lockQuoteForCustomer(tx: Tx, actor: Actor, requestId: string, quoteId: string) {
@@ -359,7 +390,19 @@ export class QuotesService implements OnModuleInit, OnModuleDestroy {
    */
   async acceptQuote(actor: Actor, requestId: string, quoteId: string, input: AcceptQuoteInput) {
     await this.expireStale();
-    const orderId = await this.db.transaction().execute(async (tx) => {
+    // Find the vendor and date without locking, so the vendor-day lock can be taken FIRST.
+    // Every accept for the same vendor and date then queues on that one lock before touching
+    // any rows, which keeps concurrent accepts from deadlocking on each other's row locks.
+    const target = await this.db
+      .selectFrom('quotes')
+      .innerJoin('eventRequests', 'eventRequests.id', 'quotes.eventRequestId')
+      .select(['quotes.vendorId', 'eventRequests.eventDate', 'eventRequests.customerId'])
+      .where('quotes.id', '=', quoteId)
+      .where('quotes.eventRequestId', '=', requestId)
+      .executeTakeFirst();
+    if (!target || target.customerId !== actor.userId) throw notFound('Quote');
+    const orderId = await withDeadlockRetry(() => this.db.transaction().execute(async (tx) => {
+      await appLock(tx, vendorDayLockKey(target.vendorId, target.eventDate));
       const { request, quote } = await this.lockQuoteForCustomer(tx, actor, requestId, quoteId);
       if (request.status !== 'OPEN') throw conflict('REQUEST_CLOSED', `This request is already ${request.status.toLowerCase()}.`);
       const today = todayIST();
@@ -396,15 +439,7 @@ export class QuotesService implements OnModuleInit, OnModuleDestroy {
       const order = await this.orders.createFromAcceptedQuote(tx, actor, { request, quote, revision, items, vendor });
 
       await tx.updateTable('quotes').set({ status: 'ACCEPTED', updatedAt: now() }).where('id', '=', quoteId).execute();
-      const others = await tx
-        .updateTable('quotes')
-        .set({ status: 'NOT_SELECTED', updatedAt: now() })
-        .output(['inserted.id', 'inserted.vendorId'])
-        .where('eventRequestId', '=', requestId)
-        .where('id', '!=', quoteId)
-        .where('status', 'not in', QUOTE_TERMINAL)
-        .execute();
-      for (const o of others) await this.outbox.enqueue(tx, 'quote.not_selected', { quoteId: o.id, vendorId: o.vendorId, reference: request.reference });
+      await this.closeOtherQuotes(tx, requestId, quoteId, request.reference);
       await tx.updateTable('eventRequests').set({ status: 'ACCEPTED', updatedAt: now() }).where('id', '=', requestId).execute();
       await this.audit.record(
         actor,
@@ -412,7 +447,7 @@ export class QuotesService implements OnModuleInit, OnModuleDestroy {
         tx,
       );
       return order.id;
-    });
+    }));
     return this.orders.detail(actor, orderId);
   }
 

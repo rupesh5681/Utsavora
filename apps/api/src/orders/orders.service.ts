@@ -13,7 +13,7 @@ import {
 } from '@utsavora/types';
 import type { OrderActionInput, OrderListQuery, RecordPaymentInput } from '@utsavora/validation';
 import { DB } from '../config';
-import { appLock, json, lockRow, now, sql, type Db, type DbOrTx, type Tx } from '../db/client';
+import { json, lockRow, now, sql, type Db, type DbOrTx, type Tx } from '../db/client';
 import type { EventRequest, Quote, QuoteItem, QuoteRevision, Vendor } from '../db/types';
 import { conflict, forbidden, notFound, unprocessable } from '../common/errors';
 import { AuditService } from '../common/audit.service';
@@ -97,7 +97,10 @@ export class OrdersService {
     return def?.bps ?? 1000;
   }
 
-  /** Must be called inside the accept-quote transaction. */
+  /**
+   * Must be called inside the accept-quote transaction, which must already hold the
+   * vendor-day application lock (vendorDayLockKey) taken before any row locks.
+   */
   async createFromAcceptedQuote(
     tx: Tx,
     actor: Actor,
@@ -105,8 +108,7 @@ export class OrdersService {
   ) {
     const { request, quote, revision, items, vendor } = ctx;
 
-    // Serialise capacity checks per vendor per date, then count active bookings.
-    await appLock(tx, `utsavora:vendor-day:${vendor.id}:${request.eventDate}`);
+    // Count active bookings; the caller's vendor-day lock serialises this check.
     const { booked } = await tx
       .selectFrom('orders')
       .select((eb) => eb.fn.countAll<number>().as('booked'))

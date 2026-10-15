@@ -170,4 +170,26 @@ export async function appLock(trx: Tx, resource: string, timeoutMs = 10_000) {
   if ((r.rows[0]?.result ?? -1) < 0) throw Object.assign(new Error('Could not acquire lock'), { number: 1222 });
 }
 
+/** Lock key for a vendor's capacity on one calendar date. */
+export const vendorDayLockKey = (vendorId: string, eventDate: string) => `utsavora:vendor-day:${vendorId}:${eventDate}`;
+
+const RETRYABLE = new Set([1205, 1222]); // deadlock victim, lock request timeout
+
+/**
+ * Runs a transaction, retrying a few times if SQL Server picks it as a deadlock victim.
+ * Use only for work that is safe to repeat from the start (everything inside the transaction is rolled back).
+ */
+export async function withDeadlockRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const x = e as { number?: number; cause?: { number?: number }; originalError?: { number?: number; info?: { number?: number } } };
+      const num = x?.number ?? x?.cause?.number ?? x?.originalError?.number ?? x?.originalError?.info?.number;
+      if (i >= attempts || num === undefined || !RETRYABLE.has(num)) throw e;
+      await new Promise((r) => setTimeout(r, 20 * i + Math.floor(Math.random() * 30)));
+    }
+  }
+}
+
 export { sql };
