@@ -34,7 +34,7 @@ jobs:
           pnpm --filter @utsavora/types --filter @utsavora/validation test
           pnpm --filter @utsavora/api test:unit
       - name: API end-to-end tests (real SQL Server 2022)
-        run: pnpm --filter @utsavora/api exec jest --runInBand --selectProjects e2e
+        run: .github/scripts/annotate-on-failure.sh pnpm --filter @utsavora/api exec jest --runInBand --selectProjects e2e --ci
       - name: Production build of the API, migrate twice, seed, and smoke test
         working-directory: apps/api
         env:

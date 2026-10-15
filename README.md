@@ -13,7 +13,7 @@ This repository contains the **foundation and first working slice** from the mas
 | `apps/customer-web` | http://localhost:3000 | Customers: browse by occasion, search and filter, plan an event with a live budget estimate, compare quotes, accept, track bookings |
 | `apps/vendor-portal` | http://localhost:3001 | Vendors: register, onboarding checklist, menus/packages, quote inbox and builder with revisions, confirm and run bookings |
 | `apps/admin-portal` | http://localhost:3002 | Operations: dashboard, vendor verification, listing moderation, requests, booking queue + CSV export, verified payments, commission, audit log, alerts |
-| `apps/api` | http://localhost:4000/v1/docs | NestJS REST API over PostgreSQL |
+| `apps/api` | http://localhost:4000/v1/docs | NestJS REST API over SQL Server 2022 |
 
 Quick start, Docker, environment variables and backups: [docs/deployment.md](docs/deployment.md).
 
@@ -45,13 +45,13 @@ The repository contained only a README and licence, so there was no Yumzy code t
 ## Tests run
 
 - 10 unit tests (pricing and rounding, commission, state machines, budget estimator, validation).
-- 25 API end-to-end tests against real PostgreSQL: the full slice, revisions and stale-accept, snapshot immutability, tampered totals, expiry, decline/withdraw/reject/cancel, unmatched requests, auth and cookie flags, per-app session isolation, vendor/customer isolation, admin permissions, onboarding and suspension, listing moderation and re-approval, **concurrent accepts never over-booking a vendor**, single-accept under double-click, commission changes with audit, CSV escaping, error envelopes.
+- 25 API end-to-end tests against a real SQL Server 2022 (run in GitHub Actions): the full slice, revisions and stale-accept, snapshot immutability, tampered totals, expiry, decline/withdraw/reject/cancel, unmatched requests, auth and cookie flags, per-app session isolation, vendor/customer isolation, admin permissions, onboarding and suspension, listing moderation and re-approval, **concurrent accepts never over-booking a vendor**, single-accept under double-click, commission changes with audit, CSV escaping, error envelopes.
 - Typecheck of all workspaces and production builds of all three web apps.
 - A browser run through the real apps (vendor registers and is approved → customer plans and requests → vendor quotes → customer accepts → vendor confirms → admin records the advance → customer sees "Confirmed").
 
 ## Deviations from the brief
 
-- **ORM: Drizzle instead of Prisma.** Prisma's engine binaries couldn't be downloaded in the build environment, so it could not be migrated or tested. Drizzle generates plain SQL migrations; see [docs/architecture.md](docs/architecture.md).
+- **Database: SQL Server 2022 instead of PostgreSQL, Kysely instead of Prisma.** Chosen so the database is one the team already runs. The schema is plain T-SQL (`apps/api/migrations/`) you can read and run in SSMS; see [docs/database-schema.md](docs/database-schema.md).
 - **Payments are manual.** The brief requires verifying a provider's marketplace/split-settlement capabilities and Indian compliance before choosing one; that needs commercial decisions and credentials. Until then only admin-verified offline payments exist, and no booking is ever marked paid by the browser.
 
 ## Known limitations and next steps
